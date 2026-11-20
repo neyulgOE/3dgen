@@ -375,17 +375,17 @@ def filter_mesh_by_view_support(mesh, indices, poses, depth_np, masks, intrinsic
 def flatten_planar_regions(
     mesh,
     max_planes: int = 6,
-    ransac_distance_m: float = 0.0035,
-    normal_angle_thresh_deg: float = 15.0,
-    min_cluster_ratio: float = 0.05,
+    ransac_distance_m: float = 0.0045,
+    normal_angle_thresh_deg: float = 18.0,
+    min_cluster_ratio: float = 0.03,
     blend_alpha: float = 0.85,
 ):
     """
-    Làm phẳng tự thích nghi các bề mặt phẳng lớn (vách hộp) và TỰ ĐỘNG BỎ QUA
-    các bề mặt cong/trụ (thân cốc, chai lọ) nhờ:
+    Làm phẳng tự thích nghi các mặt phẳng thật (kể cả mặt bên hẹp của Box) và
+    TỰ ĐỘNG BỎ QUA bề mặt cong/trụ (Cốc, chai lọ) theo 2 tiêu chuẩn bất biến tỷ lệ:
       1. Normal-Position Correlation Gate (|r| > 0.42)
-      2. Parabolic Arch / Sagitta Sign Test (> 1.0mm)
-    Chỉ đánh dấu loại trừ cụm đồng hướng pháp tuyến để bảo toàn cạnh 90° của hộp.
+      2. Scale-Invariant Radius of Curvature Test: R_est = span^2 / (8 * |sagitta|) < 0.22m
+         kèm |sagitta| > 1.4mm (không bao giờ loại nhầm mặt hộp rộng bị gợn nhiễu D435f).
     """
     vertices = np.asarray(mesh.vertices).copy()
     triangles = np.asarray(mesh.triangles)
@@ -396,7 +396,6 @@ def flatten_planar_regions(
     mesh.compute_vertex_normals()
     normals = np.asarray(mesh.vertex_normals).copy()
 
-    # Dựng danh sách kề đỉnh từ lưới tam giác để tìm miền liên thông thực sự
     adj = [[] for _ in range(n_verts)]
     for a, b, c in triangles:
         ai, bi, ci = int(a), int(b), int(c)
@@ -405,7 +404,7 @@ def flatten_planar_regions(
         adj[ci].extend((ai, bi))
 
     remaining_mask = np.ones(n_verts, dtype=bool)
-    min_verts = max(350, int(min_cluster_ratio * n_verts))
+    min_verts = max(250, int(min_cluster_ratio * n_verts))
     cos_thresh = float(np.cos(np.radians(normal_angle_thresh_deg)))
     reports = []
 
@@ -450,7 +449,7 @@ def flatten_planar_regions(
                 remaining_mask[inlier_global] = False
             continue
 
-        # Tìm thành phần liên thông lớn nhất trên mesh trong tập aligned_global
+        # Tìm miền liên thông lớn nhất trên mesh trong tập aligned_global
         in_set = np.zeros(n_verts, dtype=bool)
         in_set[aligned_global] = True
         visited = np.zeros(n_verts, dtype=bool)
@@ -478,6 +477,7 @@ def flatten_planar_regions(
             continue
 
         cluster_idx = np.array(best_cluster, dtype=np.int64)
+        # Chỉ loại cụm đã xét, bảo toàn 100% mép tường vuông góc 90° của Box
         remaining_mask[cluster_idx] = False
 
         pts = vertices[cluster_idx]
@@ -487,7 +487,7 @@ def flatten_planar_regions(
             n_plane = -n_plane
             d_plane = -d_plane
 
-        # ── KIỂM TRA HÌNH HỌC: MẶT PHẲNG THẬT (BOX) vs MẶT CONG/TRỤ (CỐC) ──
+        # ── KIỂM TRA HÌNH HỌC BẤT BIẾN TỶ LỆ: MẶT PHẲNG vs MẶT CONG/TRỤ ────
         centroid = pts.mean(axis=0)
         centered = pts - centroid
         pts_2d = centered - np.outer(centered @ n_plane, n_plane)
@@ -509,21 +509,23 @@ def flatten_planar_regions(
                     is_curved_surface = True
                     break
 
-        # 2. Parabolic Arch / Sagitta Sign Test dọc theo trục ngang u_minor
+        # 2. Scale-Invariant Radius of Curvature Test (R_est = span^2 / (8 * |sagitta|))
         if not is_curved_surface:
             coord_minor = centered @ u_minor
             span_minor = float(np.percentile(coord_minor, 95) - np.percentile(coord_minor, 5))
-            if span_minor > 0.012:
+            if span_minor > 0.015:
                 signed_dist = (pts @ n_plane) + d_plane
                 q_abs = np.abs(coord_minor)
                 inner_mask = q_abs <= np.percentile(q_abs, 35)
                 outer_mask = q_abs >= np.percentile(q_abs, 70)
                 if np.any(inner_mask) and np.any(outer_mask):
-                    arch_sagitta = float(
-                        np.median(signed_dist[inner_mask]) - np.median(signed_dist[outer_mask])
+                    arch_sagitta = abs(
+                        float(np.median(signed_dist[inner_mask]) - np.median(signed_dist[outer_mask]))
                     )
-                    if abs(arch_sagitta) > 0.0010:
-                        is_curved_surface = True
+                    if arch_sagitta > 0.0014:
+                        r_est_m = (span_minor * span_minor) / (8.0 * arch_sagitta)
+                        if r_est_m < 0.22:
+                            is_curved_surface = True
 
         if is_curved_surface:
             continue
@@ -537,7 +539,7 @@ def flatten_planar_regions(
         weights = np.where(is_boundary, 0.35 * blend_alpha, blend_alpha)
 
         signed_d = (pts @ n_plane) + d_plane
-        signed_d_clamped = np.clip(signed_d, -0.0035, 0.0035)
+        signed_d_clamped = np.clip(signed_d, -0.0040, 0.0040)
         correction = np.outer(weights * signed_d_clamped, n_plane)
         vertices[cluster_idx] = pts - correction
 

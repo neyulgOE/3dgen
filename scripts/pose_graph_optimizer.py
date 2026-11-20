@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Submap-based Pose Graph Optimizer (Geometry-Adaptive Full-Scene).
-- submap_size = 6 để triệt tiêu sai số trượt odometry bên trong từng Submap.
-- depth_trunc tự động theo khoảng cách vật thể (0.55m - 0.85m), cắt sạch nhiễu nền xa D435f.
-- SuperPoint + LightGlue (GPU) + Fine Point-to-Plane ICP hai chiều (chống trượt góc trụ).
-- Fine ICP từng frame căn trực tiếp vào Submap đã tối ưu trước khi tích hợp TSDF.
+Submap-based Pose Graph Optimizer (Geometry-Adaptive Full-Scene v2).
+- Dựng Submap sạch bằng cách căn Fine ICP từng frame lấy mẫu vào anchor_frame trước khi gộp.
+- Tự động ước lượng depth_trunc cận cảnh (0.65m - 0.95m) giữ đủ mặt bàn neo 6-DOF.
+- Chặn false loop trên Box/Cốc: khoảng cách tối thiểu max(8, M//5), lọc chặt LightGlue + ICP,
+  và chỉ giữ tối đa Top-3 cạnh loop chất lượng nhất cho mỗi Submap.
+- Tinh chỉnh Fine ICP per-frame vào chính Submap sạch đã tối ưu trước khi tích hợp TSDF.
 """
 import json
 import os
@@ -47,13 +48,14 @@ def _estimate_adaptive_depth_trunc(
     depth_list: List[np.ndarray],
     masks: Optional[List[Optional[np.ndarray]]] = None,
     depth_scale: float = 1000.0,
-    margin_m: float = 0.35,
-    min_trunc_m: float = 0.55,
-    max_trunc_m: float = 0.85,
+    margin_m: float = 0.45,
+    min_trunc_m: float = 0.65,
+    max_trunc_m: float = 0.95,
 ) -> float:
     """
     Tính tự động depth_trunc cho Full-Scene ICP:
-    Đủ rộng để giữ mặt bàn/nền sát vật thể khóa 6-DOF, nhưng cắt bỏ hoàn toàn hậu cảnh xa (> 0.85m).
+    Đủ rộng để giữ mặt bàn neo 6-DOF quanh cả Box lẫn Cốc (0.65m - 0.95m),
+    nhưng vẫn cắt sạch hậu cảnh xa > 1.0m gây nhiễu trên D435f.
     """
     samples = []
     step = max(1, len(valid_frames) // 24)
@@ -127,7 +129,11 @@ def _build_full_scene_submaps(
     depth_trunc: float = 0.80,
     voxel_size: float = 0.007,
 ) -> List[SubmapNode]:
-    """Gom mỗi 6 frame liên tiếp thành 1 Full-Scene Submap gọn, sạch và ít trôi nội bộ."""
+    """
+    Gom mỗi 6 frame liên tiếp thành 1 Full-Scene Submap SẠCH:
+    Căn Fine Point-to-Plane ICP từng frame lấy mẫu trực tiếp vào anchor_frame
+    trước khi gộp vào pcd_local để loại bỏ nhòe do odometry cũ bị trượt.
+    """
     submaps: List[SubmapNode] = []
     n = len(valid_frames)
     for sid, start in enumerate(range(0, n, submap_size)):
@@ -138,13 +144,22 @@ def _build_full_scene_submaps(
         T_anchor_w = init_poses[anchor].copy()
         T_anchor_inv = np.linalg.inv(T_anchor_w)
 
-        merged = o3d.geometry.PointCloud()
-        local_poses = {}
+        pcd_anchor = _rgbd_to_full_scene_pcd(
+            rgb_list[anchor],
+            depth_list[anchor],
+            intrinsic_o3d,
+            depth_scale=depth_scale,
+            depth_trunc=depth_trunc,
+            voxel_size=voxel_size,
+        )
+        merged = o3d.geometry.PointCloud(pcd_anchor)
+        local_poses = {anchor: np.eye(4, dtype=np.float64)}
 
         sample_step = max(1, len(chunk) // 3)
-        for k, f_idx in enumerate(chunk):
-            T_local = T_anchor_inv @ init_poses[f_idx]
-            local_poses[f_idx] = T_local
+        for k, f_idx in enumerate(chunk[1:], start=1):
+            T_local_init = T_anchor_inv @ init_poses[f_idx]
+            T_local_final = T_local_init
+
             if k % sample_step == 0 or k == len(chunk) - 1:
                 pcd_f = _rgbd_to_full_scene_pcd(
                     rgb_list[f_idx],
@@ -154,9 +169,27 @@ def _build_full_scene_submaps(
                     depth_trunc=depth_trunc,
                     voxel_size=voxel_size,
                 )
-                if len(pcd_f.points) > 0:
-                    pcd_f.transform(T_local)
-                    merged += pcd_f
+                if len(pcd_f.points) >= 80 and len(pcd_anchor.points) >= 80:
+                    reg = o3d.pipelines.registration.registration_icp(
+                        pcd_f,
+                        pcd_anchor,
+                        max_correspondence_distance=voxel_size * 3.0,
+                        init=T_local_init,
+                        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                        criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=20),
+                    )
+                    T_cand = reg.transformation
+                    delta = np.linalg.inv(T_local_init) @ T_cand
+                    if (
+                        float(reg.fitness) >= 0.55
+                        and 1e-9 < float(reg.inlier_rmse) <= 0.010
+                        and float(np.linalg.norm(delta[:3, 3])) <= 0.030
+                        and rotation_angle_deg(delta) <= 8.0
+                    ):
+                        T_local_final = T_cand
+                        pcd_f.transform(T_local_final)
+                        merged += pcd_f
+            local_poses[f_idx] = T_local_final
 
         if len(merged.points) > 0:
             merged = merged.voxel_down_sample(voxel_size)
@@ -183,8 +216,8 @@ def _verify_submap_pair_icp(
     pcd_tgt: o3d.geometry.PointCloud,
     T_init: np.ndarray,
     voxel_size: float = 0.007,
-    min_fitness: float = 0.42,
-    max_rmse: float = 0.011,
+    min_fitness: float = 0.45,
+    max_rmse: float = 0.010,
     max_cycle_t: float = 0.012,
     max_cycle_r: float = 2.0,
 ):
@@ -219,7 +252,6 @@ def _verify_submap_pair_icp(
             "rmse": rmse,
         }
 
-    # Kiểm định thuận-nghịch bằng Fine ICP khởi tạo từ inv(T_fwd)
     T_bwd_init = np.linalg.inv(T_fwd)
     reg_bwd = o3d.pipelines.registration.registration_icp(
         pcd_tgt,
@@ -270,10 +302,7 @@ def _refine_frame_against_submap(
     depth_trunc: float = 0.80,
     fine_voxel: float = 0.005,
 ) -> Tuple[np.ndarray, bool]:
-    """
-    Căn tinh từng frame lẻ vào đám mây Submap đã tối ưu bằng Fine Point-to-Plane ICP (15 iter).
-    Có chốt chặn độ lệch (<= 25mm, <= 5°) để đảm bảo không bao giờ làm lệch frame nhiễu.
-    """
+    """Căn tinh từng frame lẻ vào đám mây Submap sạch đã tối ưu bằng Fine Point-to-Plane ICP."""
     if len(submap_pcd_local.points) < 80:
         return T_frame_world_init, False
 
@@ -325,18 +354,20 @@ def build_and_optimize_pose_graph(
     voxel_size: float = 0.007,
     depth_scale: float = 1000.0,
     depth_trunc: Optional[float] = None,
-    loop_min_submap_gap: int = 4,
+    loop_min_submap_gap: Optional[int] = None,
+    max_loops_per_submap: int = 3,
     refine_per_frame: bool = True,
     log_dir: Optional[str] = None,
     log_callback: Optional[Callable[[str], None]] = None,
 ):
     """
-    Pipeline Submap PGO tự thích nghi:
-      1. Tự ước lượng depth_trunc cận cảnh (0.55m - 0.85m).
-      2. Gom ~350-430 frames thành ~55-70 Full-Scene Submaps (size=6).
-      3. Nối cạnh Odometry + Loop Closure bằng SuperPoint + LightGlue + Fine ICP 2 chiều.
+    Pipeline Submap PGO tự thích nghi v2 (Chống False Loop & Sạch Submap):
+      1. Tự ước lượng depth_trunc (0.65m - 0.95m).
+      2. Gom mỗi 6 frames thành 1 Submap sạch (đã căn Fine ICP nội bộ vào anchor).
+      3. Nối Odometry liên tiếp + tìm ứng viên Loop xa thực sự (gap >= max(8, M//5)),
+         chỉ giữ Top-3 cạnh loop tốt nhất mỗi Submap để tránh ép nhầm mặt hộp.
       4. Xả sạch VRAM GPU, giải Global Optimization (Levenberg-Marquardt).
-      5. Lan truyền pose về từng frame + chạy Fine ICP từng frame vào Submap.
+      5. Lan truyền pose về từng frame + chạy Fine ICP per-frame vào Submap.
     """
     t0 = time.time()
 
@@ -351,7 +382,7 @@ def build_and_optimize_pose_graph(
     if len(valid_frames) < 4:
         return optimized_poses, {"components": [len(valid_frames)], "node_degree": {}, "repaired_weak_nodes": []}
 
-    # ── BƯỚC 1: Tự động ước lượng depth_trunc & dựng Full-Scene Submaps ───────
+    # ── BƯỚC 1: Tự động ước lượng depth_trunc & dựng Full-Scene Submaps sạch ──
     if depth_trunc is None:
         depth_trunc = _estimate_adaptive_depth_trunc(
             valid_frames=valid_frames,
@@ -360,7 +391,7 @@ def build_and_optimize_pose_graph(
             depth_scale=depth_scale,
         )
     emit(
-        f"[SubmapPGO] Dựng Full-Scene Submaps (size={submap_size}, "
+        f"[SubmapPGO] Dựng Full-Scene Submaps sạch (size={submap_size}, "
         f"auto_depth_trunc={depth_trunc:.2f}m) cho {len(valid_frames)} frames..."
     )
 
@@ -376,7 +407,9 @@ def build_and_optimize_pose_graph(
         voxel_size=voxel_size,
     )
     M = len(submaps)
-    emit(f"[SubmapPGO] Đã gom thành {M} Submaps trong {time.time() - t0:.2f}s.")
+    if loop_min_submap_gap is None:
+        loop_min_submap_gap = max(8, M // 5)
+    emit(f"[SubmapPGO] Đã gom thành {M} Submaps sạch (loop_gap>={loop_min_submap_gap}) trong {time.time() - t0:.2f}s.")
 
     # ── BƯỚC 2: Trích xuất đặc trưng SuperPoint 1 lần trên GPU ────────────────
     t_lg = time.time()
@@ -462,10 +495,11 @@ def build_and_optimize_pose_graph(
             backbone_added += 1
             edge_logs.append({"src": k, "tgt": k - 1, "type": "backbone", "status": "BRIDGE", **stats})
 
-    # 3B. Cạnh Loop Closure / Spatial trên toàn bộ các cặp Submap
+    # 3B. Thu thập ứng viên Loop Closure xa thực sự (lọc chặt chống false loop trên Box)
+    loop_candidates = []
     for i in range(loop_min_submap_gap, M):
+        sm_src = submaps[i]
         for j in range(0, i - loop_min_submap_gap + 1):
-            sm_src = submaps[i]
             sm_tgt = submaps[j]
 
             lg_res = tracker.match_frames(
@@ -476,10 +510,13 @@ def build_and_optimize_pose_graph(
                 rgb_tgt=rgb_list[sm_tgt.anchor_frame],
                 depth_tgt=depth_list[sm_tgt.anchor_frame],
                 K=K,
-                ransac_thresh_m=0.016,
-                min_inliers=20,
+                ransac_thresh_m=0.014,
+                min_inliers=28,
             )
-            if not lg_res["ok"]:
+            if not lg_res["ok"] or lg_res["inlier_ratio"] < 0.35:
+                continue
+
+            if rotation_angle_deg(lg_res["T"]) > 65.0:
                 continue
 
             ok, T_rel, info, stats = _verify_submap_pair_icp(
@@ -487,48 +524,72 @@ def build_and_optimize_pose_graph(
                 sm_tgt.pcd_local,
                 T_init=lg_res["T"],
                 voxel_size=voxel_size,
-                min_fitness=0.45,
-                max_rmse=0.010,
-                max_cycle_t=0.012,
-                max_cycle_r=2.0,
+                min_fitness=0.52,
+                max_rmse=0.0085,
+                max_cycle_t=0.010,
+                max_cycle_r=1.8,
             )
             if ok:
-                pose_graph.edges.append(
-                    o3d.pipelines.registration.PoseGraphEdge(
-                        source_node_id=i,
-                        target_node_id=j,
-                        transformation=T_rel,
-                        information=info,
-                        uncertain=True,
-                    )
-                )
-                submap_degree[i] += 1
-                submap_degree[j] += 1
-                accepted_loop += 1
-                edge_logs.append(
+                score = float(lg_res["num_inliers"]) * stats["fitness"] / max(0.002, stats["rmse"])
+                loop_candidates.append(
                     {
+                        "score": score,
                         "src": i,
                         "tgt": j,
-                        "src_frame": sm_src.anchor_frame,
-                        "tgt_frame": sm_tgt.anchor_frame,
-                        "type": "loop",
-                        "status": "ACCEPT",
+                        "T_rel": T_rel,
+                        "info": info,
                         "lg_inliers": lg_res["num_inliers"],
-                        **stats,
+                        "stats": stats,
                     }
                 )
-                emit(
-                    f"   [SubmapPGO] ACCEPT loop SM {i}(f{sm_src.anchor_frame})->SM {j}(f{sm_tgt.anchor_frame}) "
-                    f"(LG={lg_res['num_inliers']}, fit={stats['fitness']:.3f}, rmse={stats['rmse']*1000:.1f}mm, "
-                    f"cyc_t={stats['cycle_t']*1000:.1f}mm, cyc_r={stats['cycle_r']:.2f}°)"
-                )
 
-    # Giải phóng hoàn toàn VRAM GPU của SuperPoint + LightGlue
+    # Giải phóng ngay VRAM GPU của SuperPoint + LightGlue
     tracker.release()
 
+    # Chỉ giữ tối đa Top-3 cạnh loop chất lượng nhất cho mỗi Submap node
+    loop_candidates.sort(key=lambda c: c["score"], reverse=True)
+    loop_node_count = defaultdict(int)
+    for cand in loop_candidates:
+        i, j = cand["src"], cand["tgt"]
+        if loop_node_count[i] >= max_loops_per_submap or loop_node_count[j] >= max_loops_per_submap:
+            continue
+        pose_graph.edges.append(
+            o3d.pipelines.registration.PoseGraphEdge(
+                source_node_id=i,
+                target_node_id=j,
+                transformation=cand["T_rel"],
+                information=cand["info"],
+                uncertain=True,
+            )
+        )
+        loop_node_count[i] += 1
+        loop_node_count[j] += 1
+        submap_degree[i] += 1
+        submap_degree[j] += 1
+        accepted_loop += 1
+
+        st = cand["stats"]
+        edge_logs.append(
+            {
+                "src": i,
+                "tgt": j,
+                "src_frame": submaps[i].anchor_frame,
+                "tgt_frame": submaps[j].anchor_frame,
+                "type": "loop",
+                "status": "ACCEPT",
+                "lg_inliers": cand["lg_inliers"],
+                **st,
+            }
+        )
+        emit(
+            f"   [SubmapPGO] ACCEPT loop SM {i}(f{submaps[i].anchor_frame})->SM {j}(f{submaps[j].anchor_frame}) "
+            f"(LG={cand['lg_inliers']}, fit={st['fitness']:.3f}, rmse={st['rmse']*1000:.1f}mm, "
+            f"cyc_t={st['cycle_t']*1000:.1f}mm, cyc_r={st['cycle_r']:.2f}°)"
+        )
+
     emit(
-        f"[SubmapPGO] Xây xong đồ thị ({M} nodes): odom={accepted_odom}, "
-        f"backbone={backbone_added}, loop={accepted_loop} trong {time.time() - t0:.2f}s."
+        f"[SubmapPGO] Xây xong đồ thị ({M} nodes): odom={accepted_odom}, backbone={backbone_added}, "
+        f"loop={accepted_loop}/{len(loop_candidates)} (top-{max_loops_per_submap}/node) trong {time.time() - t0:.2f}s."
     )
 
     # ── BƯỚC 4: Tối ưu toàn cục Levenberg-Marquardt trên M Submaps ────────────
@@ -582,7 +643,6 @@ def build_and_optimize_pose_graph(
             else:
                 T_smooth = T_raw
 
-            # Căn tinh Fine Point-to-Plane ICP từng frame vào Submap đã tối ưu
             if refine_per_frame and f_idx != sm.anchor_frame:
                 T_final, ok_ref = _refine_frame_against_submap(
                     rgb_frame=rgb_list[f_idx],
@@ -617,9 +677,12 @@ def build_and_optimize_pose_graph(
                     "num_frames": len(valid_frames),
                     "depth_trunc_m": round(depth_trunc, 3),
                     "submap_size": submap_size,
+                    "loop_min_submap_gap": loop_min_submap_gap,
+                    "max_loops_per_submap": max_loops_per_submap,
                     "accepted_odom": accepted_odom,
                     "backbone_added": backbone_added,
                     "accepted_loop": accepted_loop,
+                    "total_loop_candidates": len(loop_candidates),
                     "per_frame_refined": refined_ok_count,
                     "max_shift_mm": round(max_shift_mm, 3),
                     "elapsed_sec": round(time.time() - t0, 2),

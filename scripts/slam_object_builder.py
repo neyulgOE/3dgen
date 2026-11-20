@@ -425,7 +425,9 @@ def main():
     parser.add_argument("--cotracker-n-points", type=int, default=96)
     parser.add_argument("--cotracker-min-inliers", type=int, default=8)
     parser.add_argument("--cotracker-inlier-thr-mm", type=float, default=10.0)
-    parser.add_argument("--min-view-support", type=int, default=2, help="Gọt sạch tam giác rác ở biên mask SAM2")
+    parser.add_argument("--min-view-support", type=int, default=1, help="Giữ 1 để không đục thủng mặt tối của Box")
+    parser.add_argument("--tsdf-mask-erode-px", type=int, default=2,
+                        help="Co nhẹ mask SAM2 (2px) trước TSDF để cắt rác viền mà không thủng lõi")
     parser.add_argument("--keyframe-translation", type=float, default=0.005)
     parser.add_argument("--keyframe-rotation", type=float, default=2.0)
     parser.add_argument("--keyframe-max-gap", type=int, default=15)
@@ -438,9 +440,9 @@ def main():
     parser.add_argument("--skip-zero-degree-frames", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--flatten-planes", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--flatten-max-planes", type=int, default=6)
-    parser.add_argument("--flatten-distance-mm", type=float, default=3.5)
-    parser.add_argument("--flatten-normal-angle-deg", type=float, default=15.0)
-    parser.add_argument("--flatten-min-ratio", type=float, default=0.05)
+    parser.add_argument("--flatten-distance-mm", type=float, default=4.5)
+    parser.add_argument("--flatten-normal-angle-deg", type=float, default=18.0)
+    parser.add_argument("--flatten-min-ratio", type=float, default=0.03)
     parser.add_argument("--trim-support-plane", action=argparse.BooleanOptionalAction, default=False,
                         help="Tự động phát hiện mặt bàn đỡ dưới chân vật thể, cắt bỏ chân lem và bịt đáy phẳng.")
     parser.add_argument("--trim-support-margin-mm", type=float, default=4.0)
@@ -861,12 +863,14 @@ def main():
             depth_list=depth_np,
             init_poses=optimized_poses,
             intrinsic_o3d=intrinsic,
-            masks=masks,             # Chỉ dùng để tự tính depth_trunc cận cảnh (0.55m - 0.85m)
+            masks=masks,             # Chỉ dùng để tự tính depth_trunc cận cảnh (0.65m - 0.95m)
             submap_size=6,
             voxel_size=0.007,
             depth_scale=1000.0,
-            depth_trunc=None,        # Tự động tính từ độ sâu thực tế của vật thể
-            refine_per_frame=True,   # Fine Point-to-Plane ICP từng frame vào Submap
+            depth_trunc=None,          # Tự động trong khoảng [0.65m, 0.95m]
+            loop_min_submap_gap=None,  # Tự động = max(8, M // 5)
+            max_loops_per_submap=3,    # Chỉ giữ Top-3 cạnh loop tốt nhất mỗi Submap
+            refine_per_frame=True,     # Fine Point-to-Plane ICP từng frame vào Submap
             log_dir=recon_dir,
         )
 
@@ -1004,6 +1008,12 @@ def main():
     )
 
     integrated, skipped = 0, 0
+    erode_px = max(0, int(getattr(args, "tsdf_mask_erode_px", 2)))
+    erode_kernel = (
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * erode_px + 1, 2 * erode_px + 1))
+        if erode_px > 0
+        else None
+    )
 
     for fusion_number, i in enumerate(fuse_indices, start=1):
         if 'pgo_diagnostics' in locals() and 'node_degree' in pgo_diagnostics:
@@ -1023,8 +1033,14 @@ def main():
             skipped += 1
             continue
 
+        mask_u8 = (mask > 0).astype(np.uint8)
+        if erode_kernel is not None:
+            mask_eroded = cv2.erode(mask_u8, erode_kernel, iterations=1)
+            if np.count_nonzero(mask_eroded) >= int(0.40 * obj_px):
+                mask_u8 = mask_eroded
+
         depth_m = depth_np[i].copy().astype(np.float32)
-        d_in_mask = depth_m[mask > 0]
+        d_in_mask = depth_m[mask_u8 > 0]
         d_valid   = d_in_mask[(d_in_mask > 50) & (d_in_mask < 2000)]
         if len(d_valid) < 100:
             skipped += 1
@@ -1040,7 +1056,7 @@ def main():
         lower_cut = max(50.0, frame_median - half_band)
         upper_cut = min(2000.0, frame_median + half_band)
 
-        depth_m[mask == 0] = 0
+        depth_m[mask_u8 == 0] = 0
         depth_m[depth_m < lower_cut] = 0
         depth_m[depth_m > upper_cut] = 0
 

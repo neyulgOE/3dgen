@@ -524,9 +524,11 @@ def main():
             min_confidence=args.min_mask_confidence, min_px=300)
             
         del sam2_predictor
-        del yolo_model
-        torch.cuda.empty_cache()
+        if yolo_model is not None:
+            del yolo_model
         gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         for i, m in enumerate(masks):
             if m is not None:
                 cv2.imwrite(cached_mask_paths[i], (m * 255).astype(np.uint8))
@@ -844,161 +846,45 @@ def main():
                                optimized_poses, color_np, depth_np, masks,
                                intrinsic_tensor, voxel=args.merge_voxel)
 
-        # ── STEP 5: Sinh Candidate pairs ─────────────────────────────────────
-        print("   -> (STEP 5) Sinh Candidate pairs cho View Graph & Đóng vòng...")
-        from candidate_selection import generate_candidate_pairs
-        
+        # ── STEP 5 & 6: Submap PGO Full-Scene (SuperPoint + LightGlue + ICP) ──
+        print("   -> (STEP 5-6) Chạy Submap PGO Full-Scene (SuperPoint + LightGlue + ICP)...")
+        from pose_graph_optimizer import build_and_optimize_pose_graph
+
         valid_frames = set()
         for sm in submaps:
             valid_frames.update(sm)
-            
-        candidate_pairs = generate_candidate_pairs(
-            valid_frames=valid_frames,
-            optimized_poses=optimized_poses,
-            color_np=color_np,
-            max_temporal=5,
-            spatial_dist_thr=0.20,
-            spatial_angle_thr=38.0,
-            num_visual_loops=args.visual_loop_candidates,
-            include_non_temporal=args.pgo_non_temporal_edges,
-            submaps=submaps,
-        )
-        print(f"      Sinh được {len(candidate_pairs)} candidate pairs.")
-        
-        # ── STEP 6: Hoàn thiện View Graph & PGO ─────────────────────────────
-        print("   -> (STEP 6) Xây dựng View Graph và chạy Pose Graph Optimization...")
-        from pose_graph_optimizer import build_and_optimize_pose_graph
+        valid_indices = sorted(list(valid_frames))
 
-        view_graph_voxel = max(args.merge_voxel, 0.015)
-        effective_max_rmse = max(args.merge_max_rmse, args.merge_max_rmse_ratio * view_graph_voxel)
-        effective_max_rmse = min(effective_max_rmse, args.scene_max_rmse)
-        odometry_max_rmse = (args.odometry_max_rmse if args.odometry_max_rmse is not None
-                             else args.scene_max_rmse)
-        print(f"      View-Graph RMSE gate: {effective_max_rmse*1000:.1f}mm (loop/spatial) | "
-              f"{odometry_max_rmse*1000:.1f}mm (temporal, fitness>={args.odometry_min_fitness})")
-
-        optimized_poses, pgo_diagnostics, edge_transforms = build_and_optimize_pose_graph(
-            valid_frames=valid_frames,
-            candidate_pairs=candidate_pairs,
-            optimized_poses=optimized_poses,
-            color_np=color_np,
-            depth_np=depth_np,
-            masks=masks,
-            intrinsic_tensor=intrinsic_tensor,
-            voxel_size=view_graph_voxel,
-            min_icp_fitness=args.merge_min_fitness,
-            max_icp_rmse=effective_max_rmse,
-            max_cycle_translation=args.max_cycle_translation,
-            max_cycle_rotation=args.max_cycle_rotation,
-            odometry_min_fitness=args.odometry_min_fitness,
-            odometry_max_rmse=odometry_max_rmse,
-            odometry_max_cycle_translation=args.odometry_max_cycle_translation,
-            odometry_max_cycle_rotation=args.odometry_max_cycle_rotation,
-            use_colored_icp=False,
+        optimized_poses, pgo_diagnostics = build_and_optimize_pose_graph(
+            valid_frames=valid_indices,
+            rgb_list=color_np,
+            depth_list=depth_np,
+            init_poses=optimized_poses,
+            intrinsic_o3d=intrinsic,
+            submap_size=10,
+            voxel_size=0.008,
+            depth_scale=1000.0,
+            depth_trunc=1.5,
             log_dir=recon_dir,
-            refine_rounds=args.pgo_refine_rounds,
-            refine_convergence_mm=args.pgo_refine_convergence_mm,
-            loop_closure_preference=args.pgo_loop_closure_preference,
         )
 
-        trusted_indices = sorted(list(valid_frames))
+        trusted_indices = valid_indices
+        world_verified_indices = set(valid_indices)
+        unanchored_frames = set()
 
-        # ── STEP 7: Kiểm tra component cô lập + Đóng vòng 360° + CoTracker ──
-        print("   -> (STEP 7) Kiểm tra component cô lập, Đóng vòng 360° + CoTracker recovery...")
-
-        edge_records_path = os.path.join(recon_dir, "view_graph_edges.json")
-        accepted_edge_pairs = []
-        _eg = {"edges": []}
-        try:
-            with open(edge_records_path, "r", encoding="utf-8") as _ef:
-                _eg = json.load(_ef)
-            for _e in _eg.get("edges", []):
-                if _e.get("accepted"):
-                    accepted_edge_pairs.append((_e["src"], _e["tgt"]))
-        except Exception as _ex:
-            print(f"      [STEP 7] Không đọc được view_graph_edges.json ({_ex}), bỏ qua.")
-
-        _parent = {f: f for f in valid_frames}
-        def _find(x):
-            while _parent[x] != x:
-                _parent[x] = _parent[_parent[x]]
-                x = _parent[x]
-            return x
-        def _union(a, b):
-            ra, rb = _find(a), _find(b)
-            if ra != rb:
-                _parent[rb] = ra
-
-        for _s, _t in accepted_edge_pairs:
-            if _s in _parent and _t in _parent:
-                _union(_s, _t)
-
-        from collections import defaultdict
-        _components = defaultdict(list)
-        for f in valid_frames:
-            _components[_find(f)].append(f)
-
-        _acquisition_anchor = min(valid_frames) if valid_frames else None
-        _anchor_component = next(
-            (component for component in _components.values()
-             if _acquisition_anchor in component), [])
-        _comp_list = ([_anchor_component] +
-                      sorted((component for component in _components.values()
-                              if component is not _anchor_component),
-                             key=len, reverse=True))
-
-        print(f"      View Graph: {len(_comp_list)} connected component(s), "
-              f"sizes: {[len(c) for c in _comp_list[:8]]}")
-
-        main_comp_set = set(_comp_list[0]) if _comp_list else set()
-        isolated_comps = _comp_list[1:] if len(_comp_list) > 1 else []
-
-        view_graph_voxel_lc = max(args.merge_voxel, 0.015)
-        world_verified_indices = set(main_comp_set)
-        unanchored_frames = set().union(*(set(component) for component in isolated_comps)) if isolated_comps else set()
-
-        for _ic_idx, _iso_comp in enumerate(isolated_comps):
-            if len(_iso_comp) < 2:
-                continue
-            _iso_sorted = sorted(_iso_comp)
-            _n_cl = max(3, min(12, len(_iso_comp) // 3))
-            _main_sorted = sorted(main_comp_set)
-            _probe_lists = [
-                _main_sorted[-_n_cl:] + _iso_sorted[:_n_cl],
-                _iso_sorted[-_n_cl:]  + _main_sorted[:_n_cl],
-            ]
-            _lc_ok = False
-            for _probe in _probe_lists:
-                _T_loop, _lc_diag = estimate_loop_closure(
-                    _probe,
-                    optimized_poses,
-                    color_np, depth_np, masks,
-                    intrinsic_tensor,
-                    voxel=view_graph_voxel_lc,
-                    min_fitness=args.merge_min_fitness * 0.80,
-                    max_rmse=effective_max_rmse * 1.25,
-                    max_cycle_translation=args.max_cycle_translation * 2.0,
-                    max_cycle_rotation=args.max_cycle_rotation * 3.0,
-                    n_cluster=_n_cl,
-                )
-                if _T_loop is not None:
-                    optimized_poses = apply_rigid_component_transform(
-                        optimized_poses, _iso_sorted, _T_loop)
-                    main_comp_set.update(_iso_comp)
-                    world_verified_indices.update(_iso_comp)
-                    unanchored_frames.difference_update(_iso_comp)
-                    _lc_ok = True
-                    break
-
-        # ── Khép vòng toàn cục (Global Trajectory Loop Closure) ─────────────
-        if args.loop_closure and len(world_verified_indices) >= args.loop_closure_min_frames:
-            _verified_sorted = sorted(world_verified_indices)
-            _n_lc_cluster = min(args.loop_closure_cluster, len(_verified_sorted) // 3)
+        # ── STEP 7: Kiểm tra kết quả khép vòng 360° ─────────────────────────────
+        accepted_loops = int(pgo_diagnostics.get("accepted_loop_edges", 0))
+        if accepted_loops > 0:
+            print(f"   -> (STEP 7) ✅ SubmapPGO đã khép vòng 360° với {accepted_loops} cạnh loop (bỏ qua CoTracker3).")
+        elif args.loop_closure and len(trusted_indices) >= args.loop_closure_min_frames:
+            view_graph_voxel_lc = max(args.merge_voxel, 0.015)
+            effective_max_rmse = min(max(args.merge_max_rmse, args.merge_max_rmse_ratio * view_graph_voxel_lc), args.scene_max_rmse)
+            _n_lc_cluster = min(args.loop_closure_cluster, len(trusted_indices) // 3)
             if _n_lc_cluster >= 3:
-                print(f"      [Global Loop Closure] Kiểm tra khép vòng trên "
-                      f"{len(_verified_sorted)} frames (cluster={_n_lc_cluster})...")
+                print(f"   -> (STEP 7) [Fallback Global Loop Closure] Kiểm tra khép vòng trên "
+                      f"{len(trusted_indices)} frames (cluster={_n_lc_cluster})...")
                 _T_global_loop, _glc_diag = estimate_loop_closure(
-                    _verified_sorted,
+                    trusted_indices,
                     optimized_poses,
                     color_np, depth_np, masks,
                     intrinsic_tensor,
@@ -1010,48 +896,18 @@ def main():
                     n_cluster=_n_lc_cluster,
                 )
                 if _T_global_loop is not None:
-                    _head_start = _glc_diag.get("head_frames", [_verified_sorted[0]])[0]
+                    _head_start = _glc_diag.get("head_frames", [trusted_indices[0]])[0]
                     print(f"      [Global Loop Closure] ✅ Khép vòng 360° thành công "
                           f"(khớp với đoạn frame {_glc_diag.get('head_frames')}): "
                           f"bù sai số t={_glc_diag.get('translation_mm', 0):.1f}mm, "
                           f"r={_glc_diag.get('rotation_deg', 0):.2f}° dọc quỹ đạo.")
                     optimized_poses = apply_loop_closure(
-                        optimized_poses, _verified_sorted, _T_global_loop,
+                        optimized_poses, trusted_indices, _T_global_loop,
                         anchor_start_frame=_head_start)
                 else:
                     print(f"      [Global Loop Closure] Bỏ qua: {_glc_diag.get('reason', '?')} "
                           f"(fitness={_glc_diag.get('fitness', 'N/A')}, "
                           f"rmse={_glc_diag.get('rmse_mm', 'N/A')}mm)")
-
-        # ── CoTracker recovery ───────────────────────────────────────────────
-        if args.cotracker_recovery:
-            _frames_needing_recovery = [
-                i for i in range(n_frames)
-                if masks[i] is not None and i not in world_verified_indices
-            ]
-            if _frames_needing_recovery:
-                try:
-                    with open(report_path, "r", encoding="utf-8") as _rf:
-                        _rep = json.load(_rf)
-                except Exception:
-                    _rep = {}
-                _rep["trusted_indices"] = sorted(list(world_verified_indices))
-                with open(report_path, "w", encoding="utf-8") as _rf:
-                    json.dump(_rep, _rf, indent=2)
-
-                _ct_recovered = _run_cotracker_recovery(
-                    args.dataset_dir,
-                    n_points=args.cotracker_n_points,
-                    min_inliers=args.cotracker_min_inliers,
-                    inlier_thr_m=args.cotracker_inlier_thr_mm / 1000.0,
-                    optimized_poses=optimized_poses,
-                )
-                for _fi, _pose in _ct_recovered.items():
-                    if _fi not in world_verified_indices:
-                        optimized_poses[_fi] = _pose
-                        world_verified_indices.add(_fi)
-                        valid_frames.add(_fi)
-                        unanchored_frames.discard(_fi)
                 trusted_indices = sorted(list(valid_frames))
 
         try:

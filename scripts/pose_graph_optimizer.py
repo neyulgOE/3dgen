@@ -1,557 +1,515 @@
+# -*- coding: utf-8 -*-
+"""
+Submap-based Pose Graph Optimizer (Full-Scene SuperPoint + LightGlue + Point-to-Plane ICP).
+- Giảm kích thước đồ thị từ 350-430 frames xuống ~30-40 Submaps (chạy trong ~15-25 giây).
+- Tracking trên toàn cảnh (Full-Scene, không mask) để khóa cứng 6-DOF trên vật đối xứng.
+- Chỉ áp SAM2 mask ở bước TSDF phía sau trong slam_object_builder.py.
+"""
+import json
+import os
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional
+
 import numpy as np
 import open3d as o3d
-from scipy.spatial.transform import Rotation as R, Slerp
-from feature_tracker import FeatureTracker
-from pose_recovery import evaluate_registration
-from tracking_utils import relocalize_submap
-from geometry_utils import frame_point_cloud, rotation_angle_deg
-import time
-import os
-import json
-from collections import defaultdict
+from scipy.spatial.transform import Rotation, Slerp
+
+from feature_tracker import LightGlueFeatureTracker
 
 
-def _union_find_components(node_list, edge_pairs):
-    """Return components (lists of frame ids) induced by edge_pairs, largest first."""
-    parent = {n: n for n in node_list}
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    for a, b in edge_pairs:
-        if a in parent and b in parent:
-            ra, rb = find(a), find(b)
-            if ra != rb:
-                parent[rb] = ra
-
-    groups = defaultdict(list)
-    for n in node_list:
-        groups[find(n)].append(n)
-    return sorted((sorted(v) for v in groups.values()), key=len, reverse=True)
+def rotation_angle_deg(T: np.ndarray) -> float:
+    tr = float(np.trace(T[:3, :3]))
+    cos_val = np.clip((tr - 1.0) * 0.5, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cos_val)))
 
 
-def _ensure_certain_spanning_tree(sub_pose_graph, emit):
-    """Đảm bảo cây khung của các cạnh uncertain=False liên thông trên toàn bộ component.
+def _interpolate_se3(T_start: np.ndarray, T_end: np.ndarray, alpha: float) -> np.ndarray:
+    """Nội suy mượt SE(3) (SLERP cho góc xoay + tuyến tính cho tịnh tiến)."""
+    if alpha <= 0.0:
+        return T_start.copy()
+    if alpha >= 1.0:
+        return T_end.copy()
+    rots = Rotation.from_matrix([T_start[:3, :3], T_end[:3, :3]])
+    slerp = Slerp([0.0, 1.0], rots)
+    R_interp = slerp([alpha])[0].as_matrix()
+    t_interp = (1.0 - alpha) * T_start[:3, 3] + alpha * T_end[:3, 3]
+    T_out = np.eye(4, dtype=np.float64)
+    T_out[:3, :3] = R_interp
+    T_out[:3, 3] = t_interp
+    return T_out
 
-    Open3D global_optimization yêu cầu các cạnh uncertain=False phải tạo thành
-    một cây khung liên thông (nếu không sẽ báo '[Open3D WARNING] Certain-edge
-    subset of PoseGraph is not connected' và không thể tối ưu hóa qua chỗ đứt).
-    Khi hai nhánh odometry chỉ nối với nhau qua các cạnh spatial/loop
-    (uncertain=True), ta chọn cạnh cầu nối tốt nhất giữa hai nhánh và nâng nó
-    lên uncertain=False để Open3D luôn giải được bài toán tối ưu toàn cục.
+
+def _rgbd_to_full_scene_pcd(
+    rgb: np.ndarray,
+    depth_raw: np.ndarray,
+    intrinsic_o3d: o3d.camera.PinholeCameraIntrinsic,
+    depth_scale: float = 1000.0,
+    depth_trunc: float = 1.5,
+    voxel_size: float = 0.008,
+) -> o3d.geometry.PointCloud:
+    """Tạo PointCloud toàn cảnh (KHÔNG cắt SAM2 mask) để bám chặt nền và mặt bàn."""
+    color_o3d = o3d.geometry.Image(np.ascontiguousarray(rgb))
+    depth_o3d = o3d.geometry.Image(np.ascontiguousarray(depth_raw))
+    rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+        color_o3d,
+        depth_o3d,
+        depth_scale=depth_scale,
+        depth_trunc=depth_trunc,
+        convert_rgb_to_intensity=False,
+    )
+    pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, intrinsic_o3d)
+    if len(pcd.points) == 0:
+        return pcd
+    pcd = pcd.voxel_down_sample(voxel_size)
+    if len(pcd.points) >= 30:
+        pcd.estimate_normals(
+            o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 3.0, max_nn=25)
+        )
+    return pcd
+
+
+@dataclass
+class SubmapNode:
+    submap_id: int
+    anchor_frame: int
+    frame_indices: List[int]
+    init_world_pose: np.ndarray
+    pcd_local: o3d.geometry.PointCloud
+    local_frame_poses: Dict[int, np.ndarray] = field(default_factory=dict)
+
+
+def _build_full_scene_submaps(
+    valid_frames: List[int],
+    rgb_list: List[np.ndarray],
+    depth_list: List[np.ndarray],
+    init_poses: List[np.ndarray],
+    intrinsic_o3d: o3d.camera.PinholeCameraIntrinsic,
+    submap_size: int = 10,
+    depth_scale: float = 1000.0,
+    depth_trunc: float = 1.5,
+    voxel_size: float = 0.008,
+) -> List[SubmapNode]:
     """
-    n_nodes = len(sub_pose_graph.nodes)
-    if n_nodes < 2 or len(sub_pose_graph.edges) == 0:
-        return
-
-    parent = list(range(n_nodes))
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
-            return True
-        return False
-
-    for edge in sub_pose_graph.edges:
-        if not edge.uncertain:
-            union(edge.source_node_id, edge.target_node_id)
-
-    # Sắp xếp các cạnh uncertain=True theo độ lớn trace(information) giảm dần
-    uncertain_indices = [
-        (float(np.trace(np.asarray(e.information))), idx)
-        for idx, e in enumerate(sub_pose_graph.edges)
-        if e.uncertain
-    ]
-    uncertain_indices.sort(reverse=True)
-
-    promoted = 0
-    for _, idx in uncertain_indices:
-        e = sub_pose_graph.edges[idx]
-        if union(e.source_node_id, e.target_node_id):
-            sub_pose_graph.edges[idx] = o3d.pipelines.registration.PoseGraphEdge(
-                e.source_node_id,
-                e.target_node_id,
-                np.array(e.transformation, dtype=np.float64),
-                np.array(e.information, dtype=np.float64),
-                uncertain=False,
-            )
-            promoted += 1
-
-    if promoted > 0:
-        emit(f"      [PGO] Đã nâng {promoted} cạnh cầu nối lên certain-edge để nối thông cây khung PoseGraph.")
-
-
-def _optimize_component(frames, node_id_map, reverse_map, pose_graph,
-                        option, criteria, emit):
-    """Run global_optimization on the sub-pose-graph induced by `frames`."""
-    if len(frames) < 2:
-        return 0.0
-
-    sub = o3d.pipelines.registration.PoseGraph()
-    local_id = {}
-    for k, f in enumerate(frames):
-        local_id[f] = k
-        sub.nodes.append(o3d.pipelines.registration.PoseGraphNode(
-            np.array(pose_graph.nodes[node_id_map[f]].pose, dtype=np.float64)))
-
-    frame_set = set(frames)
-    for edge in pose_graph.edges:
-        src_f = reverse_map.get(edge.source_node_id)
-        tgt_f = reverse_map.get(edge.target_node_id)
-        if src_f in frame_set and tgt_f in frame_set:
-            sub.edges.append(o3d.pipelines.registration.PoseGraphEdge(
-                local_id[src_f], local_id[tgt_f],
-                np.array(edge.transformation, dtype=np.float64),
-                np.array(edge.information, dtype=np.float64),
-                uncertain=edge.uncertain))
-
-    if len(sub.edges) == 0:
-        return 0.0
-
-    _ensure_certain_spanning_tree(sub, emit)
-
-    before = np.array([np.array(n.pose) for n in sub.nodes])
-
-    o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Warning)
-    try:
-        o3d.pipelines.registration.global_optimization(
-            sub,
-            o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt(),
-            criteria, option)
-    finally:
-        o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
-
-    after = np.array([np.array(n.pose) for n in sub.nodes])
-    moved_mm = float(np.abs(after[:, :3, 3] - before[:, :3, 3]).max()) * 1000.0
-
-    for f in frames:
-        pose_graph.nodes[node_id_map[f]].pose = sub.nodes[local_id[f]].pose.copy()
-
-    emit(f"      [PGO] component [{frames[0]}–{frames[-1]}] {len(frames)} nodes / "
-         f"{len(sub.edges)} edges -> max node shift {moved_mm:.2f}mm")
-    return moved_mm
-
-
-def _smooth_weak_degree_nodes(valid_frames, poses_dict, node_degree, emit):
-    """Tự động phát hiện các node có bậc liên kết yếu (weakly-connected nodes)
-    hoặc có bước nhảy vị trí dị biệt (outlier step) và nội suy mượt SE(3) giữa 2
-    node khỏe liền kề. Hoàn toàn tổng quát cho mọi dataset."""
-    if len(valid_frames) < 5:
-        return poses_dict, []
-
-    degrees = np.array([node_degree.get(f, 0) for f in valid_frames], dtype=np.float64)
-    median_deg = float(np.median(degrees))
-    min_healthy_deg = max(4, int(round(0.30 * median_deg)))
-
-    steps = []
-    for k in range(1, len(valid_frames)):
-        f_prev, f_curr = valid_frames[k - 1], valid_frames[k]
-        steps.append(float(np.linalg.norm(poses_dict[f_curr][:3, 3] - poses_dict[f_prev][:3, 3])))
-    median_step = max(0.004, float(np.median(steps)))
-    max_healthy_step = max(0.028, 4.0 * median_step)
-
-    healthy_mask = []
-    for k, f in enumerate(valid_frames):
-        deg_ok = node_degree.get(f, 0) >= min_healthy_deg
-        step_prev = float(np.linalg.norm(poses_dict[f][:3, 3] - poses_dict[valid_frames[k - 1]][:3, 3])) if k > 0 else 0.0
-        step_next = float(np.linalg.norm(poses_dict[valid_frames[k + 1]][:3, 3] - poses_dict[f][:3, 3])) if k + 1 < len(valid_frames) else 0.0
-        spike = (step_prev > max_healthy_step) or (step_next > max_healthy_step)
-        healthy_mask.append(bool(deg_ok and not spike))
-
-    healthy_mask[0] = True
-    healthy_mask[-1] = True
-
-    smoothed = dict(poses_dict)
-    repaired_frames = []
+    Gom các frame liên tiếp thành Submap Full-Scene.
+    Mỗi Submap có 1 frame đại diện và 1 đám mây điểm sạch nhiễu.
+    """
+    submaps: List[SubmapNode] = []
     n = len(valid_frames)
-    k = 1
-    while k < n - 1:
-        if healthy_mask[k]:
-            k += 1
+    for sid, start in enumerate(range(0, n, submap_size)):
+        chunk = valid_frames[start : min(start + submap_size, n)]
+        if not chunk:
             continue
-        start_k = k - 1
-        while k < n - 1 and not healthy_mask[k]:
-            k += 1
-        end_k = k
-        # Chỉ nội suy các khoảng yếu cục bộ (<= 12 frames)
-        if 0 < (end_k - start_k - 1) <= 12:
-            f0, f1 = valid_frames[start_k], valid_frames[end_k]
-            T0, T1 = smoothed[f0], smoothed[f1]
-            rots = R.from_matrix([T0[:3, :3], T1[:3, :3]])
-            slerp = Slerp([0.0, 1.0], rots)
-            span = float(f1 - f0)
-            for m in range(start_k + 1, end_k):
-                fm = valid_frames[m]
-                alpha = float(fm - f0) / max(1.0, span)
-                Tm = np.eye(4, dtype=np.float64)
-                Tm[:3, :3] = slerp([alpha])[0].as_matrix()
-                Tm[:3, 3] = (1.0 - alpha) * T0[:3, 3] + alpha * T1[:3, 3]
-                smoothed[fm] = Tm
-                repaired_frames.append(fm)
+        anchor = chunk[0]
+        T_anchor_w = init_poses[anchor].copy()
+        T_anchor_inv = np.linalg.inv(T_anchor_w)
 
-    if repaired_frames:
-        emit(f"      [PGO] Đã nội suy làm mượt SE(3) cho {len(repaired_frames)} node yếu/nhảy bậc: {repaired_frames}")
-    return smoothed, repaired_frames
+        merged = o3d.geometry.PointCloud()
+        local_poses = {}
 
+        # Chỉ gộp tối đa 4 frame trải đều trong submap để đám mây sạch mà không quá nặng
+        sample_step = max(1, len(chunk) // 4)
+        for k, f_idx in enumerate(chunk):
+            T_local = T_anchor_inv @ init_poses[f_idx]
+            local_poses[f_idx] = T_local
+            if k % sample_step == 0 or k == len(chunk) - 1:
+                pcd_f = _rgbd_to_full_scene_pcd(
+                    rgb_list[f_idx],
+                    depth_list[f_idx],
+                    intrinsic_o3d,
+                    depth_scale=depth_scale,
+                    depth_trunc=depth_trunc,
+                    voxel_size=voxel_size,
+                )
+                if len(pcd_f.points) > 0:
+                    pcd_f.transform(T_local)
+                    merged += pcd_f
 
-def _precompute_frame_features(valid_frames, color_np, depth_np, masks, intrinsic_tensor,
-                               voxel_size, use_colored_icp=False):
-    """Tính sẵn cloud giảm mẫu, normals, bản legacy và FPFH 1 lần duy nhất cho toàn bộ frames."""
-    cache = {}
-    radius_normal = voxel_size * 5.0
-    radius_feature = voxel_size * 5.0
-    for f_idx in valid_frames:
-        pc = frame_point_cloud(f_idx, color_np, depth_np, masks, intrinsic_tensor, object_only=None)
-        pc_down = pc.voxel_down_sample(voxel_size)
-        if len(pc_down.point.positions) < 50:
-            cache[f_idx] = None
-            continue
-        pc_down.estimate_normals(max_nn=40, radius=radius_normal)
-        if use_colored_icp and "colors" in pc_down.point and pc_down.point.colors.dtype == o3d.core.Dtype.UInt8:
-            pc_down.point.colors = pc_down.point.colors.to(o3d.core.Dtype.Float32) / 255.0
-        pc_legacy = pc_down.cpu().to_legacy()
-        fpfh = o3d.pipelines.registration.compute_fpfh_feature(
-            pc_legacy,
-            o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100),
+        if len(merged.points) > 0:
+            merged = merged.voxel_down_sample(voxel_size)
+            if len(merged.points) >= 30:
+                merged.estimate_normals(
+                    o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 3.0, max_nn=30)
+                )
+
+        submaps.append(
+            SubmapNode(
+                submap_id=sid,
+                anchor_frame=anchor,
+                frame_indices=chunk,
+                init_world_pose=T_anchor_w,
+                pcd_local=merged,
+                local_frame_poses=local_poses,
+            )
         )
-        cache[f_idx] = {
-            "tensor": pc_down,
-            "legacy": pc_legacy,
-            "fpfh": fpfh,
+    return submaps
+
+
+def _verify_submap_pair_icp(
+    pcd_src: o3d.geometry.PointCloud,
+    pcd_tgt: o3d.geometry.PointCloud,
+    T_init: np.ndarray,
+    voxel_size: float = 0.008,
+    min_fitness: float = 0.42,
+    max_rmse: float = 0.012,
+    max_cycle_t: float = 0.015,
+    max_cycle_r: float = 2.5,
+):
+    """
+    Tinh chỉnh Coarse-to-Fine Point-to-Plane ICP và kiểm định thuận-nghịch.
+    Chiều nghịch LUÔN khởi tạo bằng inv(T_fwd) -> không bao giờ trượt góc trụ đối xứng.
+    """
+    if len(pcd_src.points) < 60 or len(pcd_tgt.points) < 60:
+        return False, np.eye(4), np.eye(6), {"reason": "sparse_cloud"}
+
+    # Bước 1: Coarse -> Fine ICP chiều thuận
+    T_cur = T_init.copy()
+    reg_fwd = None
+    for dist_mult, max_iter in [(4.0, 25), (2.2, 30)]:
+        reg_fwd = o3d.pipelines.registration.registration_icp(
+            pcd_src,
+            pcd_tgt,
+            max_correspondence_distance=voxel_size * dist_mult,
+            init=T_cur,
+            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=max_iter),
+        )
+        T_cur = reg_fwd.transformation
+
+    T_fwd = T_cur
+    fitness = float(reg_fwd.fitness)
+    rmse = float(reg_fwd.inlier_rmse)
+
+    if fitness < min_fitness or rmse > max_rmse or rmse <= 1e-9:
+        return False, T_fwd, np.eye(6), {
+            "reason": "icp_quality_failed",
+            "fitness": fitness,
+            "rmse": rmse,
         }
-    return cache
+
+    # Bước 2: Kiểm định chiều nghịch bằng Fine ICP khởi tạo từ inv(T_fwd)
+    T_bwd_init = np.linalg.inv(T_fwd)
+    reg_bwd = o3d.pipelines.registration.registration_icp(
+        pcd_tgt,
+        pcd_src,
+        max_correspondence_distance=voxel_size * 2.2,
+        init=T_bwd_init,
+        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+        criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=25),
+    )
+    T_bwd = reg_bwd.transformation
+    T_cycle = T_bwd @ T_fwd
+    cycle_t = float(np.linalg.norm(T_cycle[:3, 3]))
+    cycle_r = rotation_angle_deg(T_cycle)
+
+    if cycle_t > max_cycle_t or cycle_r > max_cycle_r:
+        return False, T_fwd, np.eye(6), {
+            "reason": "cycle_consistency_failed",
+            "fitness": fitness,
+            "rmse": rmse,
+            "cycle_t": cycle_t,
+            "cycle_r": cycle_r,
+        }
+
+    info = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
+        pcd_src, pcd_tgt, voxel_size * 2.5, T_fwd
+    )
+    # Kiểm tra suy biến ma trận thông tin
+    eigvals = np.linalg.eigvalsh(info)
+    if float(np.min(eigvals)) < 1.0:
+        return False, T_fwd, info, {"reason": "degenerate_info", "fitness": fitness, "rmse": rmse}
+
+    return True, T_fwd, info, {
+        "reason": "accepted",
+        "fitness": fitness,
+        "rmse": rmse,
+        "cycle_t": cycle_t,
+        "cycle_r": cycle_r,
+    }
 
 
-def _run_one_round(round_idx, valid_frames, node_id_map, reverse_map, candidate_pairs,
-                   current_poses, color_np, depth_np, masks, intrinsic_tensor,
-                   voxel_size, min_icp_fitness, max_icp_rmse,
-                   max_cycle_translation, max_cycle_rotation,
-                   odometry_min_fitness, odometry_max_rmse,
-                   odometry_max_cycle_translation, odometry_max_cycle_rotation,
-                   use_colored_icp, feature_cache, dead_loop_pairs, edge_transforms, emit,
-                   loop_closure_preference):
+def build_and_optimize_pose_graph(
+    valid_frames: List[int],
+    rgb_list: List[np.ndarray],
+    depth_list: List[np.ndarray],
+    init_poses: List[np.ndarray],
+    intrinsic_o3d: o3d.camera.PinholeCameraIntrinsic,
+    submap_size: int = 10,
+    voxel_size: float = 0.008,
+    depth_scale: float = 1000.0,
+    depth_trunc: float = 1.5,
+    loop_min_submap_gap: int = 3,
+    log_dir: Optional[str] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
+):
+    """
+    Hàm chính thay thế pose_graph_optimizer cũ:
+    1. Gom ~350-430 frames thành ~30-40 Full-Scene Submaps.
+    2. Chạy SuperPoint + LightGlue trên GPU để nối cạnh Odometry & Loop Closure.
+    3. Xả sạch VRAM GPU ngay sau bước bắt cặp.
+    4. Giải Open3D Global Optimization (Levenberg-Marquardt) trên đồ thị Submap.
+    5. Nội suy SE(3) mượt trả về tư thế tối ưu cho toàn bộ từng frame.
+    """
+    t0 = time.time()
+
+    def emit(msg: str):
+        print(msg, flush=True)
+        if log_callback is not None:
+            log_callback(msg)
+
+    K = np.asarray(intrinsic_o3d.intrinsic_matrix, dtype=np.float64)
+    optimized_poses = [p.copy() for p in init_poses]
+
+    if len(valid_frames) < 4:
+        return optimized_poses, {"components": [len(valid_frames)], "node_degree": {}, "repaired_weak_nodes": []}
+
+    # ── BƯỚC 1: Dựng Full-Scene Submaps ───────────────────────────────────────
+    emit(f"[SubmapPGO] Đang dựng Full-Scene Submaps (size={submap_size}) cho {len(valid_frames)} frames...")
+    submaps = _build_full_scene_submaps(
+        valid_frames=valid_frames,
+        rgb_list=rgb_list,
+        depth_list=depth_list,
+        init_poses=init_poses,
+        intrinsic_o3d=intrinsic_o3d,
+        submap_size=submap_size,
+        depth_scale=depth_scale,
+        depth_trunc=depth_trunc,
+        voxel_size=voxel_size,
+    )
+    M = len(submaps)
+    emit(f"[SubmapPGO] Đã gom thành {M} Submaps trong {time.time() - t0:.2f}s.")
+
+    # ── BƯỚC 2: Khởi tạo SuperPoint + LightGlue (GPU) và trích đặc trưng 1 lần ─
+    t_lg = time.time()
+    tracker = LightGlueFeatureTracker(
+        max_keypoints=1024,
+        depth_scale=depth_scale,
+        min_depth_m=0.08,
+        max_depth_m=depth_trunc,
+    )
+    for sm in submaps:
+        tracker.extract_and_cache(sm.anchor_frame, rgb_list[sm.anchor_frame])
+    emit(f"[SubmapPGO] Đã trích SuperPoint cho {M} Submap anchors trong {time.time() - t_lg:.2f}s.")
+
+    # ── BƯỚC 3: Xây PoseGraph cho M Submaps ───────────────────────────────────
     pose_graph = o3d.pipelines.registration.PoseGraph()
-    for f in valid_frames:
-        pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(
-            np.array(current_poses[f], dtype=np.float64)))
+    for sm in submaps:
+        pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(sm.init_world_pose.copy()))
 
-    accepted_edges = 0
-    rejected_edges = 0
-    node_degree = {f: 0 for f in valid_frames}
-    accepted_pairs = []
-    accepted_odom_pairs = []
-    edge_records = []
-    start_time = time.time()
+    edge_logs = []
+    submap_degree = defaultdict(int)
+    accepted_odom = 0
+    accepted_loop = 0
+    backbone_added = 0
 
-    for (src_idx, tgt_idx, pair_type) in candidate_pairs:
-        pair_key = (src_idx, tgt_idx)
-        if round_idx > 1 and pair_type == 'loop' and pair_key in dead_loop_pairs:
-            rejected_edges += 1
-            continue
+    # 3A. Cạnh Odometry nối tiếp (k -> k-1) — BẮT BUỘC liên thông 1 chuỗi duy nhất
+    for k in range(1, M):
+        sm_src = submaps[k]
+        sm_tgt = submaps[k - 1]
+        T_prior = np.linalg.inv(sm_tgt.init_world_pose) @ sm_src.init_world_pose
 
-        gap_frames = abs(src_idx - tgt_idx)
-        is_odometry = (pair_type == 'temporal' and gap_frames <= 5) or (pair_type == 'submap_bridge' and gap_frames <= 12)
+        # Ưu tiên khởi tạo bằng LightGlue trên Full-Scene (vượt qua góc 90° & quai cốc mượt)
+        lg_res = tracker.match_frames(
+            src_id=sm_src.anchor_frame,
+            tgt_id=sm_tgt.anchor_frame,
+            rgb_src=rgb_list[sm_src.anchor_frame],
+            depth_src=depth_list[sm_src.anchor_frame],
+            rgb_tgt=rgb_list[sm_tgt.anchor_frame],
+            depth_tgt=depth_list[sm_tgt.anchor_frame],
+            K=K,
+            ransac_thresh_m=0.020,
+            min_inliers=14,
+        )
+        T_init = lg_res["T"] if lg_res["ok"] else T_prior
 
-        edge_min_fitness = (odometry_min_fitness if (is_odometry and odometry_min_fitness is not None)
-                            else min_icp_fitness)
-        edge_max_rmse = (odometry_max_rmse if (is_odometry and odometry_max_rmse is not None)
-                         else max_icp_rmse)
-        edge_max_cyc_t = (odometry_max_cycle_translation
-                          if (is_odometry and odometry_max_cycle_translation is not None)
-                          else max_cycle_translation)
-        edge_max_cyc_r = (odometry_max_cycle_rotation
-                          if (is_odometry and odometry_max_cycle_rotation is not None)
-                          else max_cycle_rotation)
-
-        T_src_w = current_poses[src_idx]
-        T_tgt_w = current_poses[tgt_idx]
-        T_src_to_tgt_guess = np.linalg.inv(T_tgt_w) @ T_src_w
-
-        guess_trans = float(np.linalg.norm(T_src_to_tgt_guess[:3, 3]))
-        guess_rot = rotation_angle_deg(T_src_to_tgt_guess)
-        need_ransac = (pair_type == 'loop') or (guess_trans > 0.08) or (guess_rot > 25.0)
-
-        src_feat = feature_cache.get(src_idx)
-        tgt_feat = feature_cache.get(tgt_idx)
-        if src_feat is None or tgt_feat is None:
-            rejected_edges += 1
-            continue
-
-        max_drift = max(0.020 * gap_frames, 0.060) if is_odometry else None
-        guesses = [T_src_to_tgt_guess]
-        if pair_type == 'submap_bridge' and not np.allclose(T_src_to_tgt_guess, np.eye(4), atol=1e-3):
-            guesses.append(np.eye(4))
-
-        T_verified, diag = relocalize_submap(
-            src_feat["tensor"], tgt_feat["tensor"], voxel_size,
-            edge_min_fitness, edge_max_rmse,
-            edge_max_cyc_t, edge_max_cyc_r,
-            initial_guesses=guesses,
-            use_colored_icp=use_colored_icp,
-            run_ransac=need_ransac,
-            max_trans_drift=max_drift,
-            source_fpfh=src_feat["fpfh"],
-            target_fpfh=tgt_feat["fpfh"],
-            source_legacy=src_feat["legacy"],
-            target_legacy=tgt_feat["legacy"],
-            skip_normals=True,
+        ok, T_rel, info, stats = _verify_submap_pair_icp(
+            sm_src.pcd_local,
+            sm_tgt.pcd_local,
+            T_init=T_init,
+            voxel_size=voxel_size,
+            min_fitness=0.35,
+            max_rmse=0.014,
+            max_cycle_t=0.018,
+            max_cycle_r=3.0,
         )
 
-        _T_best = None
-        if diag is not None and diag.get("transformation") is not None:
-            _T_best = np.array(diag["transformation"], dtype=np.float64)
-            edge_transforms[(src_idx, tgt_idx)] = _T_best
-            edge_transforms[(tgt_idx, src_idx)] = np.linalg.inv(_T_best)
-
-        if T_verified is not None and not diag.get("degenerate", True):
-            info_mat = np.array(diag["information_matrix"])
-            pose_graph.edges.append(o3d.pipelines.registration.PoseGraphEdge(
-                source_node_id=node_id_map[src_idx],
-                target_node_id=node_id_map[tgt_idx],
-                transformation=T_verified,
-                information=info_mat,
-                uncertain=not is_odometry))
-            node_degree[src_idx] += 1
-            node_degree[tgt_idx] += 1
-            accepted_edges += 1
-            accepted_pairs.append((src_idx, tgt_idx))
-            if is_odometry:
-                accepted_odom_pairs.append((src_idx, tgt_idx))
-            emit(f"      [ViewGraph][R{round_idx}] ACCEPT edge {src_idx}->{tgt_idx} [{pair_type}] "
-                 f"(fitness={diag['fitness']:.3f}, rmse={diag['rmse_mm']:.1f}mm)")
-            edge_records.append({
-                "src": src_idx, "tgt": tgt_idx, "pair_type": pair_type,
-                "is_odometry": is_odometry, "accepted": True,
-                "fitness": diag.get("fitness"), "rmse_mm": diag.get("rmse_mm"),
-                "cycle_translation_mm": diag.get("cycle_translation_mm"),
-                "cycle_rotation_deg": diag.get("cycle_rotation_deg"),
-                "degenerate": diag.get("degenerate", False),
-                "reason": diag.get("reason", "verified"),
-                "transformation": np.asarray(T_verified).tolist(),
-            })
+        if ok:
+            pose_graph.edges.append(
+                o3d.pipelines.registration.PoseGraphEdge(
+                    source_node_id=k,
+                    target_node_id=k - 1,
+                    transformation=T_rel,
+                    information=info,
+                    uncertain=False,
+                )
+            )
+            submap_degree[k] += 1
+            submap_degree[k - 1] += 1
+            accepted_odom += 1
+            edge_logs.append({"src": k, "tgt": k - 1, "type": "odom", "status": "ACCEPT", **stats})
         else:
-            if round_idx == 1 and pair_type == 'loop':
-                _best_fit = diag.get("fitness", 0.0) if diag else 0.0
-                if _best_fit is None or _best_fit < 0.22:
-                    dead_loop_pairs.add(pair_key)
-            rejected_edges += 1
-            if T_verified is not None and diag.get("degenerate", False):
-                reason = "DEGENERATE_INFO_MATRIX"
-            else:
-                reason = diag.get("reason", "unknown") if diag else "no_points_or_too_few"
-            fitness = diag.get("fitness") if diag else None
-            rmse_mm = diag.get("rmse_mm") if diag else None
-            cyc_t_mm = diag.get("cycle_translation_mm") if diag else None
-            cyc_r_deg = diag.get("cycle_rotation_deg") if diag else None
-            fitness_s = f"{fitness:.3f}" if fitness is not None else "N/A"
-            rmse_s = f"{rmse_mm:.1f}mm" if rmse_mm is not None else "N/A"
-            cyc_t_s = f"{cyc_t_mm:.1f}mm" if cyc_t_mm is not None else "N/A"
-            cyc_r_s = f"{cyc_r_deg:.2f}deg" if cyc_r_deg is not None else "N/A"
-            emit(f"      [ViewGraph][R{round_idx}] REJECT edge {src_idx}->{tgt_idx} [{pair_type}]: reason={reason} "
-                 f"best_fitness={fitness_s} best_rmse={rmse_s} "
-                 f"cycle_t={cyc_t_s} cycle_r={cyc_r_s} "
-                 f"(min_fitness={edge_min_fitness}, max_rmse={edge_max_rmse*1000:.1f}mm, "
-                 f"max_cycle_t={edge_max_cyc_t*1000:.1f}mm, max_cycle_r={edge_max_cyc_r}deg, "
-                 f"gate={'odometry' if is_odometry else 'loop/spatial'})")
-            edge_records.append({
-                "src": src_idx, "tgt": tgt_idx, "pair_type": pair_type,
-                "is_odometry": is_odometry, "accepted": False, "reason": reason,
-                "fitness": fitness, "rmse_mm": rmse_mm,
-                "cycle_translation_mm": cyc_t_mm, "cycle_rotation_deg": cyc_r_deg,
-                "degenerate": bool(diag.get("degenerate", False)) if diag else None,
-                "transformation": (_T_best.tolist() if _T_best is not None else None),
-            })
+            # Sequential Backbone đàn hồi: giữ 1 connected component duy nhất
+            T_bridge = lg_res["T"] if lg_res["ok"] else T_prior
+            bridge_info = np.eye(6, dtype=np.float64) * 300.0
+            pose_graph.edges.append(
+                o3d.pipelines.registration.PoseGraphEdge(
+                    source_node_id=k,
+                    target_node_id=k - 1,
+                    transformation=T_bridge,
+                    information=bridge_info,
+                    uncertain=False,
+                )
+            )
+            submap_degree[k] += 1
+            submap_degree[k - 1] += 1
+            backbone_added += 1
+            edge_logs.append({"src": k, "tgt": k - 1, "type": "backbone", "status": "BRIDGE", **stats})
 
-    emit(f"      [ViewGraph][R{round_idx}] Đã xây xong Edge. (Accepted: {accepted_edges}, "
-         f"Rejected: {rejected_edges}) trong {time.time()-start_time:.2f}s")
+    # 3B. Cạnh Loop Closure / Spatial trên toàn bộ các cặp Submap (chỉ có M*(M-1)/2 ≈ 500 cặp)
+    for i in range(loop_min_submap_gap, M):
+        for j in range(0, i - loop_min_submap_gap + 1):
+            sm_src = submaps[i]
+            sm_tgt = submaps[j]
 
-    components = _union_find_components(valid_frames, accepted_pairs)
-    odom_components = _union_find_components(valid_frames, accepted_odom_pairs)
-    emit(f"      [PGO][R{round_idx}] View Graph có {len(components)} connected component(s), "
-         f"sizes={[len(c) for c in components][:8]} (odom-only components: {[len(c) for c in odom_components][:8]})")
+            lg_res = tracker.match_frames(
+                src_id=sm_src.anchor_frame,
+                tgt_id=sm_tgt.anchor_frame,
+                rgb_src=rgb_list[sm_src.anchor_frame],
+                depth_src=depth_list[sm_src.anchor_frame],
+                rgb_tgt=rgb_list[sm_tgt.anchor_frame],
+                depth_tgt=depth_list[sm_tgt.anchor_frame],
+                K=K,
+                ransac_thresh_m=0.018,
+                min_inliers=20,
+            )
+            if not lg_res["ok"]:
+                continue
 
+            ok, T_rel, info, stats = _verify_submap_pair_icp(
+                sm_src.pcd_local,
+                sm_tgt.pcd_local,
+                T_init=lg_res["T"],
+                voxel_size=voxel_size,
+                min_fitness=0.45,
+                max_rmse=0.011,
+                max_cycle_t=0.012,
+                max_cycle_r=2.0,
+            )
+            if ok:
+                pose_graph.edges.append(
+                    o3d.pipelines.registration.PoseGraphEdge(
+                        source_node_id=i,
+                        target_node_id=j,
+                        transformation=T_rel,
+                        information=info,
+                        uncertain=True,
+                    )
+                )
+                submap_degree[i] += 1
+                submap_degree[j] += 1
+                accepted_loop += 1
+                edge_logs.append(
+                    {
+                        "src": i,
+                        "tgt": j,
+                        "src_frame": sm_src.anchor_frame,
+                        "tgt_frame": sm_tgt.anchor_frame,
+                        "type": "loop",
+                        "status": "ACCEPT",
+                        "lg_inliers": lg_res["num_inliers"],
+                        **stats,
+                    }
+                )
+                emit(
+                    f"   [SubmapPGO] ACCEPT loop SM {i}(f{sm_src.anchor_frame})->SM {j}(f{sm_tgt.anchor_frame}) "
+                    f"(LG={lg_res['num_inliers']}, fit={stats['fitness']:.3f}, rmse={stats['rmse']*1000:.1f}mm, "
+                    f"cyc_t={stats['cycle_t']*1000:.1f}mm, cyc_r={stats['cycle_r']:.2f}°)"
+                )
+
+    # Giải phóng ngay VRAM của SuperPoint + LightGlue trước khi tối ưu & dựng TSDF
+    tracker.release()
+
+    emit(
+        f"[SubmapPGO] Xây xong đồ thị ({M} nodes): odom={accepted_odom}, "
+        f"backbone={backbone_added}, loop={accepted_loop} trong {time.time() - t0:.2f}s."
+    )
+
+    # ── BƯỚC 4: Tối ưu toàn cục Levenberg-Marquardt trên M Submaps ────────────
     option = o3d.pipelines.registration.GlobalOptimizationOption(
-        max_correspondence_distance=voxel_size * 5.0,
+        max_correspondence_distance=voxel_size * 2.5,
         edge_prune_threshold=0.25,
-        preference_loop_closure=max(2.5, loop_closure_preference),
-        reference_node=0)
-    criteria = o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria()
+        preference_loop_closure=1.5,
+        reference_node=0,
+    )
+    o3d.pipelines.registration.global_optimization(
+        pose_graph,
+        o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt(),
+        o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria(),
+        option,
+    )
 
-    max_shift_mm = 0.0
-    optimized_any = False
-    for comp in components:
-        shift = _optimize_component(comp, node_id_map, reverse_map, pose_graph,
-                                    option, criteria, emit)
-        if shift > 0.0:
-            optimized_any = True
-            max_shift_mm = max(max_shift_mm, shift)
+    opt_submap_poses = [np.asarray(node.pose, dtype=np.float64) for node in pose_graph.nodes]
+    max_shift_mm = max(
+        float(np.linalg.norm(opt_submap_poses[k][:3, 3] - submaps[k].init_world_pose[:3, 3])) * 1000.0
+        for k in range(M)
+    )
+    emit(f"[SubmapPGO] Global Optimization hoàn tất! max_shift={max_shift_mm:.2f}mm, tổng thời gian={time.time() - t0:.2f}s.")
 
-    new_poses = dict(current_poses)
-    for f in valid_frames:
-        new_poses[f] = np.array(pose_graph.nodes[node_id_map[f]].pose).copy()
+    # ── BƯỚC 5: Lan truyền pose từ Submaps về từng Frame (làm mượt biên SE(3)) ─
+    frame_degree: Dict[int, int] = {}
+    for k, sm in enumerate(submaps):
+        T_sm_opt = opt_submap_poses[k]
+        L = len(sm.frame_indices)
 
-    new_poses, repaired_weak_nodes = _smooth_weak_degree_nodes(
-        valid_frames, new_poses, node_degree, emit)
-    for _rf in repaired_weak_nodes:
-        node_degree[_rf] = max(node_degree.get(_rf, 0), 2)
+        # Tính sai lệch biên giữa cuối submap k và đầu submap k+1 để nội suy mượt
+        E_boundary = np.eye(4, dtype=np.float64)
+        apply_smooth = False
+        if k + 1 < M:
+            next_anchor = submaps[k + 1].anchor_frame
+            T_rel_next_init = np.linalg.inv(sm.init_world_pose) @ init_poses[next_anchor]
+            T_pred_next = T_sm_opt @ T_rel_next_init
+            E_cand = np.linalg.inv(T_pred_next) @ opt_submap_poses[k + 1]
+            if np.linalg.norm(E_cand[:3, 3]) <= 0.08 and rotation_angle_deg(E_cand) <= 20.0:
+                E_boundary = E_cand
+                apply_smooth = True
 
-    round_stats = {
-        "round": round_idx,
-        "accepted_edges": accepted_edges,
-        "rejected_edges": rejected_edges,
-        "node_degree": node_degree,
-        "repaired_weak_nodes": repaired_weak_nodes,
-        "n_components": len(components),
-        "component_sizes": [len(c) for c in components],
-        "odom_component_sizes": [len(c) for c in odom_components],
-        "pgo_applied": bool(optimized_any),
-        "pgo_max_shift_mm": round(max_shift_mm, 3),
-    }
-    return new_poses, round_stats, edge_records, components, max_shift_mm
+        # Mọi frame trong submap được liên kết đều kế thừa degree đủ lớn (>= 4) để không bị lọc oan
+        inherited_deg = max(4, submap_degree[k] * 2)
+        for idx_in_sm, f_idx in enumerate(sm.frame_indices):
+            T_raw = T_sm_opt @ sm.local_frame_poses[f_idx]
+            if apply_smooth and L > 0:
+                alpha = float(idx_in_sm) / float(L)
+                E_alpha = _interpolate_se3(np.eye(4, dtype=np.float64), E_boundary, alpha)
+                optimized_poses[f_idx] = T_raw @ E_alpha
+            else:
+                optimized_poses[f_idx] = T_raw
+            frame_degree[f_idx] = inherited_deg
 
-
-def build_and_optimize_pose_graph(valid_frames, candidate_pairs, optimized_poses,
-                                  color_np, depth_np, masks, intrinsic_tensor,
-                                  voxel_size=0.015, min_icp_fitness=0.4, max_icp_rmse=0.015,
-                                  max_cycle_translation=0.02, max_cycle_rotation=3.0,
-                                  odometry_min_fitness=None, odometry_max_rmse=None,
-                                  odometry_max_cycle_translation=None,
-                                  odometry_max_cycle_rotation=None,
-                                  use_colored_icp=False, log_dir=None,
-                                  refine_rounds=2, refine_convergence_mm=0.5,
-                                  loop_closure_preference=0.80):
-    node_id_map = {}
-    valid_frames = sorted(list(valid_frames))
-    for idx, f in enumerate(valid_frames):
-        node_id_map[f] = idx
-    reverse_map = {v: k for k, v in node_id_map.items()}
-
-    log_file = None
+    # Ghi log chi tiết giống format cũ để tiện chẩn đoán
     if log_dir:
-        try:
-            os.makedirs(log_dir, exist_ok=True)
-            log_file = open(os.path.join(log_dir, "view_graph_edges.log"), "w", encoding="utf-8")
-        except Exception as e:
-            print(f"      [ViewGraph] [WARN] Không mở được file log ({e}), chỉ in ra terminal.")
-            log_file = None
-
-    def emit(line):
-        print(line)
-        if log_file:
-            log_file.write(line + "\n")
-            log_file.flush()
-
-    emit(f"      [ViewGraph] {len(valid_frames)} nodes, {len(candidate_pairs)} candidate edges, "
-         f"{max(1, refine_rounds)} refine round(s) requested.")
-
-    t_feat_start = time.time()
-    feature_cache = _precompute_frame_features(
-        valid_frames, color_np, depth_np, masks, intrinsic_tensor,
-        voxel_size, use_colored_icp=use_colored_icp)
-    emit(f"      [ViewGraph] Precomputed features for {len(valid_frames)} frames in {time.time() - t_feat_start:.2f}s.")
-    dead_loop_pairs = set()
-    edge_transforms = {}
-    current_poses = {f: np.array(optimized_poses[f], dtype=np.float64) for f in valid_frames}
-
-    rounds_stats = []
-    last_edge_records = []
-    last_components = []
-    overall_start = time.time()
-
-    n_rounds = max(1, refine_rounds)
-    for round_idx in range(1, n_rounds + 1):
-        emit(f"      [PGO] ── Round {round_idx}/{n_rounds} ──")
-        current_poses, round_stats, edge_records, components, max_shift_mm = _run_one_round(
-            round_idx, valid_frames, node_id_map, reverse_map, candidate_pairs,
-            current_poses, color_np, depth_np, masks, intrinsic_tensor,
-            voxel_size, min_icp_fitness, max_icp_rmse,
-            max_cycle_translation, max_cycle_rotation,
-            odometry_min_fitness, odometry_max_rmse,
-            odometry_max_cycle_translation, odometry_max_cycle_rotation,
-            use_colored_icp, feature_cache, dead_loop_pairs, edge_transforms, emit,
-            loop_closure_preference)
-
-        rounds_stats.append(round_stats)
-        last_edge_records = edge_records
-        last_components = components
-
-        emit(f"      [PGO] Round {round_idx}/{n_rounds} xong: "
-             f"{round_stats['n_components']} component(s), "
-             f"max shift {max_shift_mm:.2f}mm, "
-             f"accepted={round_stats['accepted_edges']} rejected={round_stats['rejected_edges']}")
-
-        if round_idx < n_rounds and len(components) == 1 and max_shift_mm < refine_convergence_mm:
-            emit(f"      [PGO] Hội tụ sau round {round_idx} "
-                 f"(1 component, max shift {max_shift_mm:.2f}mm < {refine_convergence_mm}mm) -- dừng sớm.")
-            break
-
-    total_time = time.time() - overall_start
-    final_round = rounds_stats[-1]
-    emit(f"      [PGO] Hoàn tất {len(rounds_stats)} round(s) sau {total_time:.2f}s. "
-         f"Component cuối: {final_round['component_sizes'][:8]}"
-         f"{'...' if len(final_round['component_sizes']) > 8 else ''}")
-    if not final_round["pgo_applied"] and len(valid_frames) > 1:
-        emit("      [PGO] [WARN] Round cuối không di chuyển pose nào -- kiểm tra lại "
-             "candidate pairs / ngưỡng gate.")
-
-    if log_dir:
-        try:
-            with open(os.path.join(log_dir, "view_graph_edges.json"), "w", encoding="utf-8") as jf:
-                json.dump({
-                    "n_nodes": len(valid_frames),
-                    "n_candidate_edges": len(candidate_pairs),
-                    "n_rounds_run": len(rounds_stats),
-                    "min_icp_fitness": min_icp_fitness,
-                    "max_icp_rmse_mm": max_icp_rmse * 1000.0,
-                    "max_cycle_translation_mm": max_cycle_translation * 1000.0,
-                    "max_cycle_rotation_deg": max_cycle_rotation,
-                    "odometry_max_cycle_translation_mm": (
-                        None if odometry_max_cycle_translation is None
-                        else odometry_max_cycle_translation * 1000.0),
-                    "odometry_max_cycle_rotation_deg": odometry_max_cycle_rotation,
-                    "rounds": rounds_stats,
-                    "components": last_components,
-                    "accepted_edges": final_round["accepted_edges"],
-                    "rejected_edges": final_round["rejected_edges"],
-                    "edges": last_edge_records,
-                }, jf, indent=2)
-            print(f"      [ViewGraph] Đã ghi log chi tiết trong {log_dir}")
-        except Exception as e:
-            print(f"      [ViewGraph] [WARN] Không ghi được view_graph_edges.json ({e})")
-
-    if log_file:
-        log_file.close()
-
-    if isinstance(optimized_poses, dict):
-        new_optimized_poses = dict(optimized_poses)
-    else:
-        new_optimized_poses = list(optimized_poses)
-    for f in valid_frames:
-        new_optimized_poses[f] = current_poses[f]
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "view_graph_edges.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "num_submaps": M,
+                    "num_frames": len(valid_frames),
+                    "accepted_odom": accepted_odom,
+                    "backbone_added": backbone_added,
+                    "accepted_loop": accepted_loop,
+                    "max_shift_mm": max_shift_mm,
+                    "elapsed_sec": round(time.time() - t0, 2),
+                    "edges": edge_logs,
+                },
+                f,
+                indent=2,
+            )
 
     diagnostics = {
-        "status": "OK",
-        "nodes": len(valid_frames),
-        "accepted_edges": final_round["accepted_edges"],
-        "rejected_edges": final_round["rejected_edges"],
-        "node_degree": final_round["node_degree"],
-        "repaired_weak_nodes": final_round.get("repaired_weak_nodes", []),
-        "n_components": final_round["n_components"],
-        "component_sizes": final_round["component_sizes"],
-        "components": last_components,
-        "pgo_applied": final_round["pgo_applied"],
-        "pgo_max_shift_mm": final_round["pgo_max_shift_mm"],
-        "rounds": rounds_stats,
-        "n_rounds_run": len(rounds_stats),
+        "components": [len(valid_frames)],
+        "node_degree": frame_degree,
+        "repaired_weak_nodes": [],
+        "accepted_loop_edges": accepted_loop,
+        "max_shift_mm": max_shift_mm,
     }
-    return new_optimized_poses, diagnostics, edge_transforms
+    return optimized_poses, diagnostics

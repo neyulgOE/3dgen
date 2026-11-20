@@ -35,6 +35,7 @@ private:
     
     bool _connected = false;
     bool _fetching = false;
+    float _depthScaleMm = 1.0f;
 
     int _remainingFetches = 0;
     int _fetchIntervalMs = 0;

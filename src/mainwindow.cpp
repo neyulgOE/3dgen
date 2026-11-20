@@ -252,10 +252,10 @@ void MainWindow::setupUi() {
     s->setFixedWidth(78);
     return s;
   };
-  _fxSpin = mkDSpin(386.652, 100, 2000);
-  _fySpin = mkDSpin(386.652, 100, 2000);
-  _cxSpin = mkDSpin(326.089, 0, 1920);
-  _cySpin = mkDSpin(240.785, 0, 1080);
+  _fxSpin = mkDSpin(615.0, 100, 2000);
+  _fySpin = mkDSpin(615.0, 100, 2000);
+  _cxSpin = mkDSpin(320.0, 0, 1920);
+  _cySpin = mkDSpin(240.0, 0, 1080);
 
   auto *intrGrid = new QGridLayout;
   intrGrid->setContentsMargins(0, 2, 0, 0);
@@ -291,8 +291,8 @@ void MainWindow::setupUi() {
   handheldVl->setSpacing(6);
 
   _recordIntervalSpin = new QSpinBox;
-  _recordIntervalSpin->setRange(50, 5000);
-  _recordIntervalSpin->setValue(200);
+  _recordIntervalSpin->setRange(33, 5000);
+  _recordIntervalSpin->setValue(66);
   _recordIntervalSpin->setSuffix(" ms");
   _recordIntervalSpin->setFixedWidth(75);
 
@@ -303,15 +303,14 @@ void MainWindow::setupUi() {
       "QPushButton:checked { background: #ef4444; border: 2px solid #fecaca; }");
   _recordBtn->setCheckable(true);
 
+  _lblRecordHud = new QLabel("Sẵn sàng Record (cự ly chuẩn 30–50 cm)");
+  _lblRecordHud->setStyleSheet("color: #9ca3af; font-size: 11px; padding: 2px 0;");
+  _lblRecordHud->setWordWrap(true);
+
   auto *recOptRow = new QHBoxLayout;
   recOptRow->addWidget(new QLabel("Chu kỳ ghi:"));
   recOptRow->addWidget(_recordIntervalSpin);
   recOptRow->addStretch(1);
-
-  _vioScanBtn = new QPushButton("🚀 Quét VIO (Free Scan)");
-  _vioScanBtn->setStyleSheet(
-      "QPushButton { background: #1d4ed8; color: white; font-weight: bold; border-radius: 4px; padding: 6px 10px; }"
-      "QPushButton:hover { background: #2563eb; }");
 
   _replayBtn = new QPushButton("📼 Load Record (Replay)");
   _replayBtn->setStyleSheet(
@@ -325,12 +324,12 @@ void MainWindow::setupUi() {
   promptRow->addWidget(_aiPromptEdit, 1);
 
   handheldVl->addWidget(_recordBtn);
+  handheldVl->addWidget(_lblRecordHud);
   handheldVl->addLayout(recOptRow);
-  handheldVl->addWidget(_vioScanBtn);
   handheldVl->addWidget(_replayBtn);
   handheldVl->addLayout(promptRow);
 
-  scanModeTabs->addTab(handheldTab, "Cầm Tay / VIO");
+  scanModeTabs->addTab(handheldTab, "Cầm Tay (Record / Replay)");
 
   // Subtab B: Orbital Scan
   auto *orbitalTab = new QWidget;
@@ -919,6 +918,42 @@ void MainWindow::wireSelf() {
           &MainWindow::onScanFinished);
   connect(_ctrl, &AppController::recordingStateChanged, this,
           &MainWindow::onRecordingStateChanged);
+  connect(_ctrl, &AppController::recordStatsUpdated, this,
+          [this](int frames, double fps, float centerMm) {
+              if (!_lblRecordHud) return;
+              QString distTag;
+              QString color;
+              if (centerMm <= 1.0f) {
+                  distTag = "Mất depth tâm";
+                  color = "#e67e22";
+              } else if (centerMm < 250.0f) {
+                  distTag = QString("QUÁ GẦN (%1 cm) - Lùi ra 30–50cm!").arg(centerMm / 10.0f, 0, 'f', 1);
+                  color = "#e74c3c";
+              } else if (centerMm <= 550.0f) {
+                  distTag = QString("Cự ly chuẩn (%1 cm)").arg(centerMm / 10.0f, 0, 'f', 1);
+                  color = "#2ecc71";
+              } else {
+                  distTag = QString("Hơi xa (%1 cm)").arg(centerMm / 10.0f, 0, 'f', 1);
+                  color = "#f1c40f";
+              }
+              _lblRecordHud->setStyleSheet(QString("color: %1; font-weight: bold; font-size: 11px;").arg(color));
+              _lblRecordHud->setText(
+                  QString("REC: %1 frames | %2 FPS | %3")
+                      .arg(frames).arg(fps, 0, 'f', 1).arg(distTag));
+          });
+  connect(_ctrl, &AppController::intrinsicsUpdated, this,
+          [this](const CameraIntrinsics &intr) {
+              QSignalBlocker b1(_fxSpin), b2(_fySpin), b3(_cxSpin), b4(_cySpin);
+              _fxSpin->setValue(intr.fx);
+              _fySpin->setValue(intr.fy);
+              _cxSpin->setValue(intr.cx);
+              _cySpin->setValue(intr.cy);
+              _cloudView->setIntrinsics(intr);
+          });
+  connect(_ctrl, &AppController::lastDatasetChanged, this,
+          [this](const QString &dir) {
+              statusBar()->showMessage("Dataset sẵn sàng: " + dir, 5000);
+          });
 
   // Camera trajectory → PointCloudWidget (SLAM-like visualization)
   connect(_ctrl, &AppController::cameraTrajectoryUpdated,
@@ -969,6 +1004,7 @@ void MainWindow::wireSelf() {
 
   // 3D view controls
   connect(_accumCheck, &QCheckBox::toggled, this, [this](bool checked) {
+    _ctrl->scanEngine()->setEnabled(checked);
     _cloudView->setAccumulate(checked);
     _exportCloudBtn->setEnabled(checked); // Simple check
     appendLog(QString("Cloud Accumulator: %1").arg(checked ? "ON" : "OFF"));
@@ -1037,25 +1073,6 @@ void MainWindow::wireSelf() {
 
   connect(_killProcessesBtn, &QPushButton::clicked, this, &MainWindow::onKillProcessesClicked);
 
-  connect(_vioScanBtn, &QPushButton::clicked, this, [this]() {
-    if (_vioScanBtn->text().contains("Dừng")) {
-      _ctrl->stopVioScan();
-      _vioScanBtn->setText("🚀 Quét VIO (Free Scan)");
-      _vioScanBtn->setStyleSheet(
-          "QPushButton { background-color: #2196F3; color: white; "
-          "font-weight: bold; border-radius: 4px; padding: 6px 12px; }"
-          "QPushButton:hover { background-color: #1976D2; }");
-    } else {
-      _ctrl->setAiPrompt(_aiPromptEdit->text());
-      _ctrl->startVioScan();
-      _vioScanBtn->setText("⏹ Dừng Quét VIO");
-      _vioScanBtn->setStyleSheet(
-          "QPushButton { background-color: #F44336; color: white; "
-          "font-weight: bold; border-radius: 4px; padding: 6px 12px; }"
-          "QPushButton:hover { background-color: #D32F2F; }");
-    }
-  });
-  
   connect(_replayBtn, &QPushButton::clicked, this, [this]() {
       QString dir = QFileDialog::getExistingDirectory(this, "Select Record Directory", QCoreApplication::applicationDirPath() + "/records");
       if (!dir.isEmpty()) {
@@ -1137,30 +1154,35 @@ void MainWindow::wireSelf() {
 // ──────────────────────────────────────────────────────────
 
 void MainWindow::onRecordButtonClicked() {
-    if (_recordBtn->text().contains("Dừng")) {
+    if (_ctrl->appState() == AppState::Recording) {
         _ctrl->stopRecording();
     } else {
-        // Tắt tính toán live để đỡ nặng máy và sai lệch khi cầm tay (để dành tính toán sau bằng nút Run ICP)
+        // Tắt tính toán live để đỡ nặng máy và sai lệch khi cầm tay
         if (_accumCheck->isChecked()) _accumCheck->setChecked(false);
         if (_icpCheck->isChecked()) _icpCheck->setChecked(false);
-        
+
         _ctrl->startRecording(_recordIntervalSpin->value());
     }
 }
 
 void MainWindow::onRecordingStateChanged(bool isRecording) {
+    _recordBtn->setChecked(isRecording);
     if (isRecording) {
         _recordBtn->setText("⏹ Dừng Record");
         _recordBtn->setStyleSheet(
-            "QPushButton{background:#333333;color:#ff5555;font-weight:bold;border-radius:3px;padding:4px 10px; border: 1px solid #ff5555;}"
+            "QPushButton{background:#333333;color:#ff5555;font-weight:bold;border-radius:4px;padding:7px 12px; border: 2px solid #ff5555;}"
             "QPushButton:hover{background:#553333;}");
         _recordIntervalSpin->setEnabled(false);
     } else {
-        _recordBtn->setText("🔴 Record");
+        _recordBtn->setText("🔴 Bắt Đầu Record");
         _recordBtn->setStyleSheet(
-            "QPushButton{background:#7a2020;color:white;font-weight:bold;border-radius:3px;padding:4px 10px;}"
-            "QPushButton:hover{background:#a03030;}");
+            "QPushButton{background:#991b1b;color:white;font-weight:bold;border-radius:4px;padding:7px 12px;}"
+            "QPushButton:hover{background:#b91c1c;}");
         _recordIntervalSpin->setEnabled(true);
+        if (_lblRecordHud) {
+            _lblRecordHud->setStyleSheet("color: #9ca3af; font-size: 11px; padding: 2px 0;");
+            _lblRecordHud->setText("Sẵn sàng Record (cự ly chuẩn 30–50 cm)");
+        }
     }
 }
 

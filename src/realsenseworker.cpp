@@ -24,10 +24,6 @@ void RealSenseWorker::init()
     try {
         _cfg.enable_stream(RS2_STREAM_COLOR, 640, 480, RS2_FORMAT_RGB8, 30);
         _cfg.enable_stream(RS2_STREAM_DEPTH, 640, 480, RS2_FORMAT_Z16, 30);
-        try {
-            _cfg.enable_stream(RS2_STREAM_ACCEL, RS2_FORMAT_MOTION_XYZ32F);
-            _cfg.enable_stream(RS2_STREAM_GYRO, RS2_FORMAT_MOTION_XYZ32F);
-        } catch (...) {} // Ignore if IMU is not supported
     } catch (const rs2::error & e) {
         emit errorOccurred(QString("RealSense Init Error: %1").arg(e.what()));
     }
@@ -41,8 +37,29 @@ void RealSenseWorker::connectHost(const QString &ip, quint16 port)
     if (_connected) return;
 
     try {
-        _pipeline.start(_cfg);
+        rs2::pipeline_profile profile = _pipeline.start(_cfg);
         _connected = true;
+
+        _depthScaleMm = 1.0f;
+        try {
+            auto sensor = profile.get_device().first<rs2::depth_sensor>();
+            _depthScaleMm = sensor.get_depth_scale() * 1000.0f;
+        } catch (...) {}
+
+        try {
+            auto colorStream = profile.get_stream(RS2_STREAM_COLOR).as<rs2::video_stream_profile>();
+            rs2_intrinsics colorIntr = colorStream.get_intrinsics();
+            emit intrinsicsReady(colorIntr.width, colorIntr.height,
+                                 colorIntr.fx, colorIntr.fy,
+                                 colorIntr.ppx, colorIntr.ppy);
+            emit logMessage(QString("RealSense Color-Aligned Intrinsics: %1x%2 fx=%3 fy=%4 cx=%5 cy=%6")
+                                .arg(colorIntr.width).arg(colorIntr.height)
+                                .arg(colorIntr.fx, 0, 'f', 2).arg(colorIntr.fy, 0, 'f', 2)
+                                .arg(colorIntr.ppx, 0, 'f', 2).arg(colorIntr.ppy, 0, 'f', 2));
+        } catch (const rs2::error &intrErr) {
+            emit logMessage(QString("RealSense Intrinsics Warning: %1").arg(intrErr.what()));
+        }
+
         emit connectionChanged(true);
         emit logMessage("RealSense connected successfully.");
     } catch (const rs2::error & e) {
@@ -112,11 +129,7 @@ void RealSenseWorker::processNextFrame()
         return;
     }
 
-    float depth_scale_mm = 1.0f; // Default 1mm
-    try {
-        auto sensor = _pipeline.get_active_profile().get_device().first<rs2::depth_sensor>();
-        depth_scale_mm = sensor.get_depth_scale() * 1000.0f;
-    } catch(...) {}
+    const float depth_scale_mm = _depthScaleMm;
 
     try {
         rs2::frameset frames;
@@ -195,9 +208,9 @@ void RealSenseWorker::processNextFrame()
         }
         
         if (!gotAny) {
-            // No frames ready yet. Re-queue if fetching.
+            // No frames ready yet. Re-queue if fetching (15ms avoids 200Hz spin).
             if (_fetching && (_remainingFetches > 0 || _remainingFetches == -1)) {
-                QTimer::singleShot(5, this, &RealSenseWorker::processNextFrame);
+                QTimer::singleShot(15, this, &RealSenseWorker::processNextFrame);
             }
             return;
         }
@@ -213,11 +226,8 @@ void RealSenseWorker::processNextFrame()
     }
 
     if (_fetching && (_remainingFetches > 0 || _remainingFetches == -1)) {
-        if (_fetchIntervalMs > 0) {
-            QTimer::singleShot(_fetchIntervalMs, this, &RealSenseWorker::processNextFrame);
-        } else {
-            QMetaObject::invokeMethod(this, "processNextFrame", Qt::QueuedConnection);
-        }
+        const int nextMs = (_fetchIntervalMs > 0) ? _fetchIntervalMs : 15;
+        QTimer::singleShot(nextMs, this, &RealSenseWorker::processNextFrame);
     } else {
         _fetching = false;
         emit fetchCountFinished();

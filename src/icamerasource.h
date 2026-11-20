@@ -39,6 +39,7 @@ signals:
     void fetchCountFinished ();
 
     void connectionChanged  (bool connected);
+    void intrinsicsReady    (int width, int height, double fx, double fy, double cx, double cy);
     void logMessage         (const QString &msg);
     void errorOccurred      (const QString &err);
 };

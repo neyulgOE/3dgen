@@ -147,9 +147,9 @@ private:
 
     // ── Continuous Recording ──────────────────────────────────────────────────
     QPushButton      *_recordBtn       = nullptr;
+    QLabel           *_lblRecordHud    = nullptr;
     QSpinBox         *_recordIntervalSpin = nullptr;
 
-    QPushButton      *_vioScanBtn      = nullptr;
     QPushButton      *_replayBtn       = nullptr;
 
     // ── Scan Timing ───────────────────────────────────────────────────────────

@@ -3,9 +3,9 @@
 
 ScanEngine::ScanEngine(QObject *parent) : QObject(parent)
 {
-    // Cắm plugin CloudAccumulator vào hệ thống
+    // Cắm plugin CloudAccumulator vào hệ thống (tắt mặc định, chỉ bật khi người dùng tích Accumulate)
     _algorithm = new CloudAccumulator(this);
-    _algorithm->setEnabled(true);
+    _algorithm->setEnabled(false);
 
     // Gắn các signal từ lõi thuật toán ra interface mới
     connect(_algorithm, &IFusionAlgorithm::deltaReady,

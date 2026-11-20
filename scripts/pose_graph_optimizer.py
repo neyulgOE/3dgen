@@ -480,7 +480,9 @@ def build_and_optimize_pose_graph(
             edge_logs.append({"src": k, "tgt": k - 1, "type": "odom", "status": "ACCEPT", **stats})
         else:
             T_bridge = lg_res["T"] if lg_res["ok"] else T_prior
-            bridge_info = np.eye(6, dtype=np.float64) * 300.0
+            # Hạ độ cứng backbone xuống 80.0 để khi có cạnh loop, PGO dồn sai số vào đúng
+            # các đoạn bị trượt thay vì làm vặn xoắn các đoạn odometry đang chuẩn
+            bridge_info = np.eye(6, dtype=np.float64) * 80.0
             pose_graph.edges.append(
                 o3d.pipelines.registration.PoseGraphEdge(
                     source_node_id=k,
@@ -495,13 +497,16 @@ def build_and_optimize_pose_graph(
             backbone_added += 1
             edge_logs.append({"src": k, "tgt": k - 1, "type": "backbone", "status": "BRIDGE", **stats})
 
-    # 3B. Thu thập ứng viên Loop Closure xa thực sự (lọc chặt chống false loop trên Box)
+    # 3B. Tìm cạnh Loop Closure 2 tầng (1 lượt LightGlue duy nhất trên GPU)
     loop_candidates = []
+    tier2_backlog = []  # Lưu sẵn cặp LightGlue đạt chuẩn Tầng 2 để khỏi chạy lại GPU
+
     for i in range(loop_min_submap_gap, M):
         sm_src = submaps[i]
         for j in range(0, i - loop_min_submap_gap + 1):
             sm_tgt = submaps[j]
 
+            # Chạy LightGlue 1 lần với ngưỡng nền của Tầng 2 (min_inliers=16)
             lg_res = tracker.match_frames(
                 src_id=sm_src.anchor_frame,
                 tgt_id=sm_tgt.anchor_frame,
@@ -510,41 +515,90 @@ def build_and_optimize_pose_graph(
                 rgb_tgt=rgb_list[sm_tgt.anchor_frame],
                 depth_tgt=depth_list[sm_tgt.anchor_frame],
                 K=K,
-                ransac_thresh_m=0.014,
-                min_inliers=28,
+                ransac_thresh_m=0.016,
+                min_inliers=16,
             )
-            if not lg_res["ok"] or lg_res["inlier_ratio"] < 0.35:
+            if not lg_res["ok"] or lg_res["inlier_ratio"] < 0.25:
                 continue
 
-            if rotation_angle_deg(lg_res["T"]) > 65.0:
+            rot_deg = rotation_angle_deg(lg_res["T"])
+            if rot_deg > 75.0:
                 continue
 
+            # Kiểm tra Tầng 1 (Strict — giữ nguyên chất lượng cao cho Box)
+            is_tier1_lg = (
+                lg_res["num_inliers"] >= 28
+                and lg_res["inlier_ratio"] >= 0.35
+                and rot_deg <= 65.0
+            )
+            if is_tier1_lg:
+                ok, T_rel, info, stats = _verify_submap_pair_icp(
+                    sm_src.pcd_local,
+                    sm_tgt.pcd_local,
+                    T_init=lg_res["T"],
+                    voxel_size=voxel_size,
+                    min_fitness=0.52,
+                    max_rmse=0.0085,
+                    max_cycle_t=0.010,
+                    max_cycle_r=1.8,
+                )
+                if ok:
+                    score = float(lg_res["num_inliers"]) * stats["fitness"] / max(0.002, stats["rmse"])
+                    loop_candidates.append(
+                        {
+                            "tier": 1,
+                            "score": score,
+                            "src": i,
+                            "tgt": j,
+                            "T_rel": T_rel,
+                            "info": info,
+                            "lg_inliers": lg_res["num_inliers"],
+                            "stats": stats,
+                        }
+                    )
+                    continue
+
+            # Nếu chưa đạt Tầng 1 nhưng vượt chuẩn LightGlue Tầng 2 -> đưa vào hàng đợi dự phòng
+            tier2_backlog.append((i, j, lg_res))
+
+    # Giải phóng ngay VRAM GPU của SuperPoint + LightGlue
+    tracker.release()
+
+    # Tầng 2 (Adaptive Fallback): Chỉ kích hoạt nếu Tầng 1 tìm được < 4 cạnh loop (vật thể trơn/ít vân)
+    used_tier = 1
+    if len(loop_candidates) < 4 and len(tier2_backlog) > 0:
+        used_tier = 2
+        emit(
+            f"[SubmapPGO] Tầng 1 chỉ tìm được {len(loop_candidates)} cạnh loop "
+            f"-> kích hoạt Tầng 2 trên {len(tier2_backlog)} cặp LightGlue dự phòng..."
+        )
+        # Sắp xếp ưu tiên các cặp nhiều inliers nhất
+        tier2_backlog.sort(key=lambda item: item[2]["num_inliers"], reverse=True)
+        for i, j, lg_res in tier2_backlog:
             ok, T_rel, info, stats = _verify_submap_pair_icp(
-                sm_src.pcd_local,
-                sm_tgt.pcd_local,
+                submaps[i].pcd_local,
+                submaps[j].pcd_local,
                 T_init=lg_res["T"],
                 voxel_size=voxel_size,
-                min_fitness=0.52,
-                max_rmse=0.0085,
-                max_cycle_t=0.010,
-                max_cycle_r=1.8,
+                min_fitness=0.42,
+                max_rmse=0.011,
+                max_cycle_t=0.015,
+                max_cycle_r=2.5,
             )
             if ok:
                 score = float(lg_res["num_inliers"]) * stats["fitness"] / max(0.002, stats["rmse"])
                 loop_candidates.append(
                     {
+                        "tier": 2,
                         "score": score,
                         "src": i,
                         "tgt": j,
                         "T_rel": T_rel,
-                        "info": info,
+                        "info": info * 0.6,  # Giảm nhẹ trọng số cạnh Tầng 2 để không lấn át odom tốt
                         "lg_inliers": lg_res["num_inliers"],
                         "stats": stats,
                     }
                 )
-
-    # Giải phóng ngay VRAM GPU của SuperPoint + LightGlue
-    tracker.release()
 
     # Chỉ giữ tối đa Top-3 cạnh loop chất lượng nhất cho mỗi Submap node
     loop_candidates.sort(key=lambda c: c["score"], reverse=True)
@@ -575,20 +629,20 @@ def build_and_optimize_pose_graph(
                 "tgt": j,
                 "src_frame": submaps[i].anchor_frame,
                 "tgt_frame": submaps[j].anchor_frame,
-                "type": "loop",
+                "type": f"loop_t{cand['tier']}",
                 "status": "ACCEPT",
                 "lg_inliers": cand["lg_inliers"],
                 **st,
             }
         )
         emit(
-            f"   [SubmapPGO] ACCEPT loop SM {i}(f{submaps[i].anchor_frame})->SM {j}(f{submaps[j].anchor_frame}) "
+            f"   [SubmapPGO][T{cand['tier']}] ACCEPT loop SM {i}(f{submaps[i].anchor_frame})->SM {j}(f{submaps[j].anchor_frame}) "
             f"(LG={cand['lg_inliers']}, fit={st['fitness']:.3f}, rmse={st['rmse']*1000:.1f}mm, "
             f"cyc_t={st['cycle_t']*1000:.1f}mm, cyc_r={st['cycle_r']:.2f}°)"
         )
 
     emit(
-        f"[SubmapPGO] Xây xong đồ thị ({M} nodes): odom={accepted_odom}, backbone={backbone_added}, "
+        f"[SubmapPGO] Xây xong đồ thị ({M} nodes, tier={used_tier}): odom={accepted_odom}, backbone={backbone_added}, "
         f"loop={accepted_loop}/{len(loop_candidates)} (top-{max_loops_per_submap}/node) trong {time.time() - t0:.2f}s."
     )
 

@@ -26,11 +26,10 @@ SOURCES += \
     src/appcontroller.cpp \
     src/cameraworker.cpp \
     src/cloudaccumulator.cpp \
+    src/datasetrecorder.cpp \
     src/depthprojector.cpp \
     src/coordinatetransformer.cpp \
     src/exporter.cpp \
-    src/fastsaminference.cpp \
-    src/keyframeextractor.cpp \
     src/main.cpp \
     src/mainwindow.cpp \
     src/netprotocol.cpp \
@@ -53,13 +52,12 @@ HEADERS += \
     src/appcontroller.h \
     src/cameraworker.h \
     src/cloudaccumulator.h \
+    src/datasetrecorder.h \
     src/depthprojector.h \
     src/coordinatetransformer.h \
     src/exporter.h \
-    src/fastsaminference.h \
     src/icamerasource.h \
     src/ifusionalgorithm.h \
-    src/keyframeextractor.h \
     src/mainwindow.h \
     src/netprotocol.h \
     src/orbitalscandialog.h \

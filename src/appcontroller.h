@@ -2,15 +2,13 @@
 #define APPCONTROLLER_H
 
 #include "coordinatetransformer.h"
-#include "icamerasource.h"
+#include "datasetrecorder.h"
 #include "depthprojector.h"
+#include "icamerasource.h"
 #include "orbitaltrajectory.h"
-#include "scansession.h"
 #include "scanengine.h"
+#include "scansession.h"
 #include "types.h"
-#include "vio_tracker.h"
-#include "keyframeextractor.h"
-#include "fastsaminference.h"
 
 #include <QFile>
 #include <QJsonObject>
@@ -20,7 +18,14 @@
 #include <QThread>
 #include <QVector>
 #include <QVector3D>
-#include <QtConcurrent/QtConcurrentRun>
+
+enum class AppState {
+    Idle,
+    LivePreview,
+    Recording,
+    Replaying,
+    BuildingMesh
+};
 
 class AppController : public QObject
 {
@@ -31,6 +36,8 @@ public:
     ~AppController() override;
 
     bool cameraConnected() const { return _camConnected; }
+    AppState appState() const { return _state; }
+    QString lastRecordedDir() const { return _lastRecordedDir; }
 
 public slots:
     // Camera
@@ -57,11 +64,7 @@ public slots:
     void startReplay(const QString &dirPath);
     void startHandheldScan(int intervalMs);
     void stopHandheldScan();
-    
-    // VIO Free Scan
-    void startVioScan();
-    void stopVioScan();
-    
+
     // AI Prompt Configuration
     void setAiPrompt(const QString &prompt) { _aiPrompt = prompt.isEmpty() ? "cup" : prompt; }
     QString aiPrompt() const { return _aiPrompt; }
@@ -75,11 +78,15 @@ signals:
     void geometryFrameReady(GeometryFrame frame);
 
     void cameraConnectionChanged(bool connected);
+    void stateChanged(AppState state);
 
     void scanProgressUpdated(int current, int total, const QString &status);
     void scanFinished();
 
     void recordingStateChanged(bool isRecording);
+    void recordStatsUpdated(int savedFrames, double fps, float centerDepthMm);
+    void lastDatasetChanged(const QString &dirPath);
+    void intrinsicsUpdated(const CameraIntrinsics &intr);
 
     /// Phát sau mỗi waypoint: danh sách các pose T_base_cam để visualize trajectory.
     void cameraTrajectoryUpdated(QVector<QMatrix4x4> poses);
@@ -97,51 +104,47 @@ signals:
 
 private slots:
     void onCameraConnectionChanged(bool connected);
-    void onCameraRGBDReady(RGBDFrame frame);
-    void onImuDataReady(const QVector<IMUData> &imuFrames);
+    void onCameraIntrinsicsReady  (int width, int height, double fx, double fy, double cx, double cy);
+    void onCameraRGBDReady        (RGBDFrame frame);
+    void onImuDataReady           (const QVector<IMUData> &imuFrames);
     void onCameraError            (const QString &err);
-    void onVioTrackingFrameReady  (const TrackingFrame &frame);
 
     void onScanRequestMove    (double dx, double dy, double dz,
-                           double droll, double dpitch, double dyaw);
+                               double droll, double dpitch, double dyaw);
     void onScanRequestSnapshot();
     void onScanRequestFetch   ();
     void onScanCaptureStarted (int orbitalWpIndex);
     void onScanFinished       ();
-    void onReplayFinished();
+    void onReplayFinished     ();
 
 private:
     void wireCamera();
     void wireScan  ();
 
-    QThread        *_workerThread = nullptr;
-    QThread        *_vioThread    = nullptr;
-    ICameraSource  *_camera       = nullptr;
-    VioTracker     *_vioTracker  = nullptr;
-    KeyframeExtractor *_keyframeExtractor = nullptr;
-    FastSamInference *_fastSam = nullptr;
-    class ReplayWorker *_replayWorker = nullptr;
-    ScanSession     _scanSession;
-    ScanEngine      _scanEngine;
+    QThread              *_workerThread = nullptr;
+    ICameraSource        *_camera       = nullptr;
+    class ReplayWorker   *_replayWorker = nullptr;
+    DatasetRecorder      *_recorder     = nullptr;
+    ScanSession           _scanSession;
+    ScanEngine            _scanEngine;
     CoordinateTransformer _transformer;
     DepthProjector        _projector;
     CameraIntrinsics      _intrinsics;
+    RecorderIntrinsics    _currentIntrinsics;
 
-    bool _camConnected     = false;
-    bool _scanFetchPending = false;
+    AppState _state            = AppState::Idle;
+    bool     _camConnected     = false;
+    bool     _scanFetchPending = false;
 
     bool                     _orbitalMode       = false;
     QVector<OrbitalWaypoint> _orbitalWps;
     int                      _currentOrbitalIdx = -1;
 
-    bool                     _isRecording = false;
-    qint64                   _recordIntervalMs = 200;
-    qint64                   _lastRecordTimeMs = 0;
-    int                      _recordFrameIdx = 0;
-
     QJsonObject              _exportedPoses;
     QString                  _currentScanDir;
+    QString                  _lastRecordedDir;
     QString                  _aiPrompt = "cup";
+    qint64                   _lastPreviewMs = 0;
 
     /// Camera trajectory: mọi phần tử là T_base_cam tại waypoint tương ứng.
     QVector<QMatrix4x4>      _camTrajectory;

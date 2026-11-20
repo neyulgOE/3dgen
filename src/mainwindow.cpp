@@ -1490,6 +1490,7 @@ void MainWindow::onRunIcpClicked()
     process->start("python", QStringList() << pyScript << currentScan
                                            << "--low-memory"
                                            << "--voxel-size" << "4.0"
+                                           << "--global-optimize"
                                            << "--no-vis");
 
     connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, [this, process, currentScan](int exitCode, QProcess::ExitStatus exitStatus) {
@@ -1763,7 +1764,7 @@ void MainWindow::onBuildMeshClicked()
     // ~7.5 degrees).  The previous cap of 24 discarded every other valid
     // view after tracking, needlessly opening faces that are visible only in
     // a narrow angular interval.
-    const QString maxViews = manualTurntable ? "48" : "160";
+    const QString maxViews = manualTurntable ? "48" : "260";
     QStringList builderArgs = {pyScript, currentScan,
                                 "--prompt", prompt, "--output", outPath,
                                 "--max-views", maxViews, "--voxel", "0.002",

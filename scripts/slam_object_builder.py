@@ -299,6 +299,19 @@ def estimate_loop_closure(verified_indices, optimized_poses, color_np, depth_np,
         diagnostics["head_frames"] = [head_idx[0], head_idx[-1]]
         diagnostics["tail_frames"] = [tail_idx[0], tail_idx[-1]]
 
+        if T_loop is None and diagnostics.get("transformation") is not None:
+            best_fitness = float(diagnostics.get("fitness", 0.0) or 0.0)
+            best_rmse = float(diagnostics.get("rmse_mm", 999.0) or 999.0) / 1000.0
+            cycle_t = float(diagnostics.get("cycle_translation_mm", 999.0) or 999.0) / 1000.0
+            cycle_r = float(diagnostics.get("cycle_rotation_deg", 999.0) or 999.0)
+            passed_gate = (
+                (best_fitness >= 0.45 and best_rmse <= 0.0085) or
+                (best_fitness >= 0.28 and best_rmse <= 0.0065 and cycle_t <= 0.012 and cycle_r <= 2.5)
+            )
+            if passed_gate:
+                T_loop = np.array(diagnostics["transformation"], dtype=np.float64)
+                diagnostics["reason"] = "verified_sharp_rmse"
+
         if T_loop is not None:
             translation_mm = float(np.linalg.norm(T_loop[:3, 3])) * 1000.0
             rotation_deg = float(np.linalg.norm(R.from_matrix(T_loop[:3, :3]).as_rotvec(degrees=True)))
@@ -376,7 +389,8 @@ def main():
                         choices=["sam2_hiera_tiny", "sam2_hiera_small",
                                  "sam2_hiera_base_plus", "sam2_hiera_large"])
     parser.add_argument("--max-input-frames", type=int, default=1000)
-    parser.add_argument("--max-views", type=int, default=160)
+    parser.add_argument("--max-views", "--max-tsdf-frames", dest="max_views", type=int, default=260,
+                        help="Tăng từ 160 lên 260 để giữ chi tiết mảnh (quai cốc, góc hộp)")
     parser.add_argument("--max-step-translation", type=float, default=0.045)
     parser.add_argument("--max-step-rotation", type=float, default=15.0)
     parser.add_argument("--scene-tracking", action=argparse.BooleanOptionalAction, default=True)
@@ -1070,7 +1084,7 @@ def main():
         _nd_map = pgo_diagnostics['node_degree']
         _all_degs = [int(_nd_map.get(f, _nd_map.get(str(f), 0))) for f in slam_trusted_set]
         _med_deg = float(np.median(_all_degs)) if _all_degs else 0.0
-        _min_fuse_deg = max(4, int(round(0.30 * _med_deg)))
+        _min_fuse_deg = 2
         _weak_deg_frames = {
             f for f in slam_trusted_set
             if int(_nd_map.get(f, _nd_map.get(str(f), 0))) < _min_fuse_deg

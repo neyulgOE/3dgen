@@ -204,25 +204,46 @@ def _smooth_weak_degree_nodes(valid_frames, poses_dict, node_degree, emit):
     return smoothed, repaired_frames
 
 
+def _precompute_frame_features(valid_frames, color_np, depth_np, masks, intrinsic_tensor,
+                               voxel_size, use_colored_icp=False):
+    """Tính sẵn cloud giảm mẫu, normals, bản legacy và FPFH 1 lần duy nhất cho toàn bộ frames."""
+    cache = {}
+    radius_normal = voxel_size * 5.0
+    radius_feature = voxel_size * 5.0
+    for f_idx in valid_frames:
+        pc = frame_point_cloud(f_idx, color_np, depth_np, masks, intrinsic_tensor, object_only=None)
+        pc_down = pc.voxel_down_sample(voxel_size)
+        if len(pc_down.point.positions) < 50:
+            cache[f_idx] = None
+            continue
+        pc_down.estimate_normals(max_nn=40, radius=radius_normal)
+        if use_colored_icp and "colors" in pc_down.point and pc_down.point.colors.dtype == o3d.core.Dtype.UInt8:
+            pc_down.point.colors = pc_down.point.colors.to(o3d.core.Dtype.Float32) / 255.0
+        pc_legacy = pc_down.cpu().to_legacy()
+        fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+            pc_legacy,
+            o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100),
+        )
+        cache[f_idx] = {
+            "tensor": pc_down,
+            "legacy": pc_legacy,
+            "fpfh": fpfh,
+        }
+    return cache
+
+
 def _run_one_round(round_idx, valid_frames, node_id_map, reverse_map, candidate_pairs,
                    current_poses, color_np, depth_np, masks, intrinsic_tensor,
                    voxel_size, min_icp_fitness, max_icp_rmse,
                    max_cycle_translation, max_cycle_rotation,
                    odometry_min_fitness, odometry_max_rmse,
                    odometry_max_cycle_translation, odometry_max_cycle_rotation,
-                   use_colored_icp, pc_cache, edge_transforms, emit,
+                   use_colored_icp, feature_cache, dead_loop_pairs, edge_transforms, emit,
                    loop_closure_preference):
     pose_graph = o3d.pipelines.registration.PoseGraph()
     for f in valid_frames:
         pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(
             np.array(current_poses[f], dtype=np.float64)))
-
-    def get_pc(f_idx):
-        if f_idx not in pc_cache:
-            pc = frame_point_cloud(f_idx, color_np, depth_np, masks, intrinsic_tensor,
-                                   object_only=None)
-            pc_cache[f_idx] = pc.voxel_down_sample(voxel_size)
-        return pc_cache[f_idx]
 
     accepted_edges = 0
     rejected_edges = 0
@@ -233,6 +254,11 @@ def _run_one_round(round_idx, valid_frames, node_id_map, reverse_map, candidate_
     start_time = time.time()
 
     for (src_idx, tgt_idx, pair_type) in candidate_pairs:
+        pair_key = (src_idx, tgt_idx)
+        if round_idx > 1 and pair_type == 'loop' and pair_key in dead_loop_pairs:
+            rejected_edges += 1
+            continue
+
         gap_frames = abs(src_idx - tgt_idx)
         is_odometry = (pair_type == 'temporal' and gap_frames <= 5) or (pair_type == 'submap_bridge' and gap_frames <= 12)
 
@@ -253,10 +279,13 @@ def _run_one_round(round_idx, valid_frames, node_id_map, reverse_map, candidate_
 
         guess_trans = float(np.linalg.norm(T_src_to_tgt_guess[:3, 3]))
         guess_rot = rotation_angle_deg(T_src_to_tgt_guess)
-        need_ransac = (pair_type == 'loop') or (guess_trans > 0.12) or (guess_rot > 28.0)
+        need_ransac = (pair_type == 'loop') or (guess_trans > 0.08) or (guess_rot > 25.0)
 
-        source_pc = get_pc(src_idx)
-        target_pc = get_pc(tgt_idx)
+        src_feat = feature_cache.get(src_idx)
+        tgt_feat = feature_cache.get(tgt_idx)
+        if src_feat is None or tgt_feat is None:
+            rejected_edges += 1
+            continue
 
         max_drift = max(0.020 * gap_frames, 0.060) if is_odometry else None
         guesses = [T_src_to_tgt_guess]
@@ -264,13 +293,18 @@ def _run_one_round(round_idx, valid_frames, node_id_map, reverse_map, candidate_
             guesses.append(np.eye(4))
 
         T_verified, diag = relocalize_submap(
-            source_pc, target_pc, voxel_size,
+            src_feat["tensor"], tgt_feat["tensor"], voxel_size,
             edge_min_fitness, edge_max_rmse,
             edge_max_cyc_t, edge_max_cyc_r,
             initial_guesses=guesses,
             use_colored_icp=use_colored_icp,
             run_ransac=need_ransac,
-            max_trans_drift=max_drift
+            max_trans_drift=max_drift,
+            source_fpfh=src_feat["fpfh"],
+            target_fpfh=tgt_feat["fpfh"],
+            source_legacy=src_feat["legacy"],
+            target_legacy=tgt_feat["legacy"],
+            skip_normals=True,
         )
 
         _T_best = None
@@ -306,6 +340,10 @@ def _run_one_round(round_idx, valid_frames, node_id_map, reverse_map, candidate_
                 "transformation": np.asarray(T_verified).tolist(),
             })
         else:
+            if round_idx == 1 and pair_type == 'loop':
+                _best_fit = diag.get("fitness", 0.0) if diag else 0.0
+                if _best_fit is None or _best_fit < 0.22:
+                    dead_loop_pairs.add(pair_key)
             rejected_edges += 1
             if T_verified is not None and diag.get("degenerate", False):
                 reason = "DEGENERATE_INFO_MATRIX"
@@ -364,6 +402,8 @@ def _run_one_round(round_idx, valid_frames, node_id_map, reverse_map, candidate_
 
     new_poses, repaired_weak_nodes = _smooth_weak_degree_nodes(
         valid_frames, new_poses, node_degree, emit)
+    for _rf in repaired_weak_nodes:
+        node_degree[_rf] = max(node_degree.get(_rf, 0), 2)
 
     round_stats = {
         "round": round_idx,
@@ -414,7 +454,12 @@ def build_and_optimize_pose_graph(valid_frames, candidate_pairs, optimized_poses
     emit(f"      [ViewGraph] {len(valid_frames)} nodes, {len(candidate_pairs)} candidate edges, "
          f"{max(1, refine_rounds)} refine round(s) requested.")
 
-    pc_cache = {}
+    t_feat_start = time.time()
+    feature_cache = _precompute_frame_features(
+        valid_frames, color_np, depth_np, masks, intrinsic_tensor,
+        voxel_size, use_colored_icp=use_colored_icp)
+    emit(f"      [ViewGraph] Precomputed features for {len(valid_frames)} frames in {time.time() - t_feat_start:.2f}s.")
+    dead_loop_pairs = set()
     edge_transforms = {}
     current_poses = {f: np.array(optimized_poses[f], dtype=np.float64) for f in valid_frames}
 
@@ -433,7 +478,7 @@ def build_and_optimize_pose_graph(valid_frames, candidate_pairs, optimized_poses
             max_cycle_translation, max_cycle_rotation,
             odometry_min_fitness, odometry_max_rmse,
             odometry_max_cycle_translation, odometry_max_cycle_rotation,
-            use_colored_icp, pc_cache, edge_transforms, emit,
+            use_colored_icp, feature_cache, dead_loop_pairs, edge_transforms, emit,
             loop_closure_preference)
 
         rounds_stats.append(round_stats)

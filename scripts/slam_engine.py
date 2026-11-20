@@ -460,6 +460,28 @@ def main():
                             pose_graph.edges.append(o3d.pipelines.registration.PoseGraphEdge(
                                 i, kf_idx, T_i_to_kf_local, info_loop, uncertain=True))
                             print(f"   🔗 [Loop Edge] Frame {i} <-> Keyframe #{kf_idx} (fitness={loop_fit:.3f})")
+
+                    if (i % 15 == 0) and len(keyframes) > 0:
+                        curr_pos = T_world_final[:3, 3]
+                        for kf in keyframes:
+                            kf_idx = kf['index']
+                            if (i - kf_idx) < 40:
+                                continue
+                            if np.linalg.norm(curr_pos - kf['T_world'][:3, 3]) < 0.15:
+                                icp_loop = o3d.pipelines.registration.registration_icp(
+                                    pcd_i_down_f, kf['pcd_down'], dist_f * 2.0, T_world_final,
+                                    o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                                    o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=40))
+                                if icp_loop.fitness >= 0.40 and icp_loop.inlier_rmse <= dist_f * 1.5:
+                                    T_world_loop = icp_loop.transformation
+                                    T_i_to_kf_local = np.linalg.inv(optimized_poses[kf_idx]) @ T_world_loop
+                                    info_loop = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
+                                        pcd_i_down_f, kf['pcd_down'], dist_f * 2.0, T_world_loop)
+                                    pose_graph.edges.append(o3d.pipelines.registration.PoseGraphEdge(
+                                        i, kf_idx, T_i_to_kf_local, info_loop, uncertain=True))
+                                    print(f"   🔗 [Spatial Loop Edge] Frame {i} <-> Keyframe #{kf_idx} "
+                                          f"(fitness={icp_loop.fitness:.3f}, rmse={icp_loop.inlier_rmse*1000:.1f}mm)")
+                                    break
             else:
                 track_loss_streak += 1
                 reloc_ok = False

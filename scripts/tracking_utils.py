@@ -216,7 +216,9 @@ def refine_pose_against_scene_map(frame_index, initial_pose_guess, scene_history
 
 def relocalize_submap(source, target, voxel_size, min_fitness, max_rmse, 
                       max_cycle_trans=0.015, max_cycle_rot=2.0, initial_guesses=None,
-                      use_colored_icp=False, run_ransac=False, max_trans_drift=None):
+                      use_colored_icp=False, run_ransac=False, max_trans_drift=None,
+                      source_fpfh=None, target_fpfh=None,
+                      source_legacy=None, target_legacy=None, skip_normals=False):
     """Return a verified source→target transform, or None when unsafe.
     - Khi max_trans_drift != None (các cạnh temporal / local spatial): chỉ tinh chỉnh
       cục bộ quanh initial_guesses[0], chặn hiện tượng ICP trượt dọc mặt phẳng.
@@ -231,11 +233,14 @@ def relocalize_submap(source, target, voxel_size, min_fitness, max_rmse,
     if initial_guesses:
         primary_guesses.extend(initial_guesses)
 
-    source.estimate_normals(max_nn=40, radius=voxel_size * 5.0)
-    target.estimate_normals(max_nn=40, radius=voxel_size * 5.0)
+    if not skip_normals:
+        source.estimate_normals(max_nn=40, radius=voxel_size * 5.0)
+        target.estimate_normals(max_nn=40, radius=voxel_size * 5.0)
 
-    source_legacy = source.cpu().to_legacy()
-    target_legacy = target.cpu().to_legacy()
+    if source_legacy is None:
+        source_legacy = source.cpu().to_legacy()
+    if target_legacy is None:
+        target_legacy = target.cpu().to_legacy()
 
     fallback_guesses = []
     # Chỉ dùng centroid fallback khi không khóa drift cục bộ (tức là cạnh loop / relocalize)
@@ -290,18 +295,20 @@ def relocalize_submap(source, target, voxel_size, min_fitness, max_rmse,
                     if forward.fitness <= 0.0:
                         break
 
+                if forward is None or forward.fitness <= 0.0:
+                    continue
+
                 forward_mat = forward.transformation.cpu().numpy()
-                backward = None
-                for corr_dist in coarse_to_fine:
-                    b_init = (backward.transformation if backward is not None else
-                              o3d.core.Tensor(np.linalg.inv(forward_mat), o3d.core.Dtype.Float64, O3D_DEVICE_CPU))
-                    backward = o3d.t.pipelines.registration.icp(
-                        target, source, max_correspondence_distance=corr_dist,
-                        init_source_to_target=b_init,
-                        estimation_method=icp_method,
-                        criteria=icp_criteria)
-                    if backward.fitness <= 0.0:
-                        break
+                # Chỉ chạy Fine Point-to-Plane ICP ở chiều nghịch (khởi tạo bằng inv(T_fwd))
+                # để tránh RANSAC/coarse trượt sang góc xoay khác trên vật thể đối xứng.
+                backward = o3d.t.pipelines.registration.icp(
+                    target, source, max_correspondence_distance=coarse_to_fine[-1],
+                    init_source_to_target=o3d.core.Tensor(
+                        np.linalg.inv(forward_mat), o3d.core.Dtype.Float64, O3D_DEVICE_CPU),
+                    estimation_method=icp_method,
+                    criteria=o3d.t.pipelines.registration.ICPConvergenceCriteria(max_iteration=25))
+                if backward.fitness <= 0.0:
+                    continue
             except RuntimeError:
                 continue
 
@@ -374,10 +381,12 @@ def relocalize_submap(source, target, voxel_size, min_fitness, max_rmse,
     # 3. Lazy RANSAC cho các cạnh đóng vòng xa
     if run_ransac and max_trans_drift is None:
         try:
-            source_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
-                source_legacy, o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 5.0, max_nn=100))
-            target_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
-                target_legacy, o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 5.0, max_nn=100))
+            if source_fpfh is None:
+                source_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+                    source_legacy, o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 5.0, max_nn=100))
+            if target_fpfh is None:
+                target_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+                    target_legacy, o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 5.0, max_nn=100))
 
             ransac = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
                 source_legacy, target_legacy, source_fpfh, target_fpfh, True, distance,

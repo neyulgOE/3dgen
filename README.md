@@ -1,82 +1,16 @@
-# TMArucoAccuracyApp
+# TMVisionary 3D Studio (`3dgen`)
 
-Qt Widgets app for measuring ArUco marker xyz error using:
-- Techman cobot for commanded offsets
-- TMVisionary API 1202 for marker xyz JSON
+Ứng dụng quét và tái tạo mô hình lưới 3D (3D Reconstruction & Mesh Studio) sử dụng camera chiều sâu Intel RealSense (D435/D435f), kết hợp giao diện C++/Qt thời gian thực với pipeline AI & SLAM ngoại tuyến (Python / Open3D Tensor GPU / PyTorch).
 
-## What this version follows closely
+## Kiến trúc hệ thống
+- **Frontend (C++ / Qt / OpenGL — `src/`):**
+  - Thu thập dữ liệu RGB-D + IMU, theo dõi VIO thời gian thực (`vio_tracker.cpp`).
+  - Trình xem Point Cloud & Mesh Studio (`meshviewerwidget.cpp`) hỗ trợ Auto Clean, tẩy thủ công, Undo và xuất `.ply` / `.obj`.
+- **Backend AI & SLAM (Python — `scripts/`):**
+  - `slam_object_builder.py`: Tách nền vật thể bằng YOLOWorld + SAM2, lọc tiền xử lý Depth, tối ưu đồ thị tư thế đa vòng (`pose_graph_optimizer.py`), khép vòng 360°, phục hồi mất dấu bằng CoTracker3 (`sparse_tracker.py`), tích hợp TSDF GPU và hậu xử lý lưới tự thích nghi hình học (`geometry_utils.py`).
+  - `slam_engine.py`: Pipeline tối ưu mây điểm toàn cảnh có tích hợp IMU và Global PGO.
 
-### Techman side
-This version follows the reference tool more closely:
-- commands can be wrapped as `TMSCT,<len>,<body>,*XX\r\n`
-- default ACK token is `$TMSCT,4,1,OK,*5C`
-- default move flow is:
-  - send offset body
-  - send `var_run=true`
-  - send `ScriptExit()`
-- `MoveDone` is waited as the completion token
-
-Default offset body in the UI:
-
-```text
-1,var_offset_x={dx}\r\nvar_offset_y={dy}\r\nvar_offset_z={dz}
-```
-
-You can change this to match your drag-and-drop program exactly.
-
-### TMVisionary side
-This version requests API `1202` using the same packet style as the vision tool:
-- 16-byte header with magic `0x5A`
-- payload = JSON UTF-8
-- parser expects fields discussed in the conversation:
-  - `type`
-  - `pub_nsec`
-  - `data_nsec`
-  - `width`, `height`
-  - `found`
-  - `marker_count`
-  - `markers[]`
-  - per marker: `id`, `center`, `c0..c3`, `has_xyz`, `xyz`
-
-## Build
-Open `TMArucoAccuracyApp.pro` in Qt Creator, or build with qmake.
-
-## Main flow
-1. Connect Techman and TMVisionary
-2. Capture baseline marker mean (`ref0`)
-3. For each offset:
-   - send Techman offset command(s)
-   - wait `MoveDone`
-   - collect N valid API 1202 samples
-   - compute mean/std
-   - compute ref at current pose
-   - write `samples.csv` and `summary.csv`
-
-## Important notes
-- Units must be consistent between Techman offsets and TMVisionary xyz.
-- If your Techman program uses different variable names or sequence, edit them in the UI.
-- If pose feedback is available, enable it and provide the pose request command.
-
-
-Version v13 changes: measure flow uses initial home from robot P1, then per-point sends offset vars first, run=1, waits MoveDone, samples marker, then reset=1 only between subsequent points. Legacy mode sends each offset variable as a separate command.
-
-
-## Robot -> Camera default TF
-
-This build defaults to the confirmed 3D mapping:
-
-- X_rb -> +Z_cm
-- Y_rb -> -X_cm
-- Z_rb -> -Y_cm
-
-For camera-to-marker reference prediction, the app uses:
-
-ref_i = ref0 - R_cm_rb * d_rb
-
-So for robot offsets (dx, dy, dz) in robot base:
-
-- x_ref = x0 + dy
-- y_ref = y0 + dz
-- z_ref = z0 - dx
-
-`ref0` is captured automatically from the first Home baseline capture.
+## Biên dịch & Chạy
+1. Mở `TMVisionaryViewer.pro` bằng Qt Creator (hoặc chạy `qmake && make -j$(nproc)`).
+2. Cài đặt phụ thuộc Python: `open3d`, `torch`, `opencv-python`, `ultralytics`, `sam2`.
+3. Chạy ứng dụng, ghi dataset trong tab **Scan & 3D Point Cloud**, sau đó dựng lưới trong tab **Mesh Studio & Cleanup**.

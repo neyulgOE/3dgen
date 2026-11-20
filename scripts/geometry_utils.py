@@ -8,6 +8,7 @@ import subprocess
 import numpy as np
 import cv2
 import open3d as o3d
+from scipy.spatial import cKDTree
 
 
 def _resolve_compute_device():
@@ -281,43 +282,596 @@ def estimate_turntable_yaw(source, reference, feature_source, feature_reference,
     diagnostics["reason"] = "verified" if accepted else "quality_gate_failed"
     return (pose if accepted else None), diagnostics
 
+def estimate_turntable_axis_from_table(indices, depth_np, masks, intrinsic, pivot=None):
+    """Ước lượng vector trục quay vuông góc mặt bàn bằng RANSAC trên vùng nền ngoài mask.
+    Trả về (axis_unit_vec, diagnostics). Fallback về (0, 1, 0) nếu không tìm được mặt phẳng bàn hợp lệ.
+    """
+    default_axis = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    if not indices:
+        return default_axis, {"reason": "no_indices", "fallback": True}
+
+    fx, fy = intrinsic.get_focal_length()
+    cx, cy = intrinsic.get_principal_point()
+
+    # Lấy tối đa 6 frame trải đều để gộp nền tĩnh, giảm nhiễu depth D435f
+    sample_pos = np.linspace(0, len(indices) - 1, min(6, len(indices))).round().astype(int)
+    sample_indices = [indices[p] for p in np.unique(sample_pos)]
+
+    # Giới hạn dải độ sâu quanh vật thể để chỉ bắt mặt bàn đỡ, tránh tường/nền xa
+    if pivot is not None:
+        z_min_mm = max(120.0, (float(pivot[2]) - 0.25) * 1000.0)
+        z_max_mm = min(1500.0, (float(pivot[2]) + 0.35) * 1000.0)
+    else:
+        z_min_mm, z_max_mm = 150.0, 1200.0
+
+    dilate_kernel = np.ones((25, 25), np.uint8)
+    bg_pts_list = []
+
+    for idx in sample_indices:
+        depth = depth_np[idx].astype(np.float32)
+        H_img = depth.shape[0]
+        valid = (depth >= z_min_mm) & (depth <= z_max_mm)
+        valid &= (np.arange(H_img)[:, None] > int(H_img * 0.55))
+        mask = masks[idx]
+        if mask is not None:
+            excl = cv2.dilate((mask > 0).astype(np.uint8), dilate_kernel, iterations=1)
+            valid &= (excl == 0)
+
+        ys, xs = np.nonzero(valid)
+        if len(xs) < 200:
+            continue
+        # Lấy mẫu thưa để RANSAC chạy nhanh (< 50ms)
+        if len(xs) > 4000:
+            step = len(xs) // 4000
+            xs, ys = xs[::step], ys[::step]
+
+        zs = depth[ys, xs] / 1000.0
+        pts = np.stack([(xs - cx) * zs / fx, (ys - cy) * zs / fy, zs], axis=1)
+        bg_pts_list.append(pts)
+
+    if not bg_pts_list:
+        return default_axis, {"reason": "no_background_points", "fallback": True}
+
+    all_bg = np.vstack(bg_pts_list)
+    if len(all_bg) < 500:
+        return default_axis, {"reason": "too_few_background_points", "count": len(all_bg), "fallback": True}
+
+    pcd_bg = o3d.geometry.PointCloud()
+    pcd_bg.points = o3d.utility.Vector3dVector(all_bg)
+    pcd_bg = pcd_bg.voxel_down_sample(0.005)
+    if len(pcd_bg.points) < 300:
+        return default_axis, {"reason": "too_few_downsampled_bg", "fallback": True}
+
+    try:
+        plane_model, inliers = pcd_bg.segment_plane(
+            distance_threshold=0.005, ransac_n=3, num_iterations=1000
+        )
+    except Exception as e:
+        return default_axis, {"reason": f"ransac_error: {e}", "fallback": True}
+
+    inlier_ratio = float(len(inliers)) / max(1, len(pcd_bg.points))
+    n = np.array(plane_model[:3], dtype=np.float64)
+    n_norm = float(np.linalg.norm(n))
+    if n_norm < 1e-8 or len(inliers) < 400 or inlier_ratio < 0.45:
+        return default_axis, {
+            "reason": "weak_table_plane",
+            "inliers": len(inliers),
+            "inlier_ratio": round(inlier_ratio, 3),
+            "fallback": True,
+        }
+    n /= n_norm
+
+    # Quy ước hệ tọa độ camera OpenCV: +Y hướng xuống (khớp mặc định (0, 1, 0))
+    if n[1] < 0:
+        n = -n
+
+    # Kiểm tra độ nghiêng hợp lý (camera chúi tối đa 60° so với phương ngang => |ny| >= 0.5)
+    if n[1] < 0.50:
+        return default_axis, {
+            "reason": "plane_not_horizontal_table",
+            "normal": [round(float(v), 4) for v in n],
+            "fallback": True,
+        }
+
+    tilt_deg = float(np.degrees(np.arccos(np.clip(n[1], -1.0, 1.0))))
+    return n, {
+        "reason": "ransac_table_plane",
+        "axis": [round(float(v), 4) for v in n],
+        "camera_tilt_deg": round(tilt_deg, 2),
+        "inliers": int(len(inliers)),
+        "inlier_ratio": round(inlier_ratio, 3),
+        "fallback": False,
+    }
+
+
+def _score_turntable_alignment(src_pts, src_cols, ref_tree, ref_cols, pose, max_dist=0.007):
+    """Chấm điểm khớp giữa đám mây nguồn (sau biến đổi pose) và đám mây tham chiếu.
+    Kết hợp cả Hình học (fitness, RMSE) và Màu sắc RGB để phá tính đối xứng trụ tròn.
+    """
+    R_mat = pose[:3, :3]
+    t_vec = pose[:3, 3]
+    cand_pts = (src_pts @ R_mat.T) + t_vec
+
+    dists, nn_idx = ref_tree.query(cand_pts, k=1, distance_upper_bound=max_dist)
+    valid = np.isfinite(dists)
+    n_inliers = int(np.count_nonzero(valid))
+    if n_inliers < 20:
+        return 0.0, max_dist, 1.0
+
+    fitness = float(n_inliers) / float(len(src_pts))
+    rmse = float(np.sqrt(np.mean(dists[valid] ** 2)))
+
+    if src_cols is not None and ref_cols is not None:
+        col_diff = np.linalg.norm(src_cols[valid] - ref_cols[nn_idx[valid]], axis=1)
+        color_err = float(np.mean(col_diff))
+    else:
+        color_err = 0.0
+
+    return fitness, rmse, color_err
+
+
+def detect_turntable_direction(valid_candidates, color_np, depth_np, masks,
+                               intrinsic_tensor, pivot, axis, turn_start, timeline_span, args):
+    """Tự động dò chiều quay bàn xoay (+1.0 hoặc -1.0) trên cung đầu tiên (~60-70°)."""
+    n_probe = min(24, len(valid_candidates))
+    if n_probe < 3:
+        return -1.0, {"reason": "too_few_frames_default_neg"}
+
+    anchor_cloud = frame_point_cloud(
+        valid_candidates[0], color_np, depth_np, masks, intrinsic_tensor
+    ).voxel_down_sample(args.turntable_voxel).cpu().to_legacy()
+    ref_pts = np.asarray(anchor_cloud.points)
+    if len(ref_pts) < 100:
+        return -1.0, {"reason": "sparse_anchor_default_neg"}
+
+    ref_cols = np.asarray(anchor_cloud.colors) if anchor_cloud.has_colors() else None
+    ref_tree = cKDTree(ref_pts)
+    max_dist = min(0.008, float(args.turntable_max_correspondence))
+
+    probe_indices = valid_candidates[1:n_probe:2]
+    scores = {}
+    for sign in (-1.0, 1.0):
+        total = 0.0
+        for idx in probe_indices:
+            angle = sign * 360.0 * (idx - turn_start) / max(1, timeline_span)
+            pcd = frame_point_cloud(
+                idx, color_np, depth_np, masks, intrinsic_tensor
+            ).voxel_down_sample(args.turntable_voxel).cpu().to_legacy()
+            pts = np.asarray(pcd.points)
+            if len(pts) < 100:
+                continue
+            cols = np.asarray(pcd.colors) if pcd.has_colors() else None
+            pose = turntable_pose(pivot, axis, angle)
+            fit, rmse, col_err = _score_turntable_alignment(pts, cols, ref_tree, ref_cols, pose, max_dist)
+            total += fit - 25.0 * rmse - 0.65 * col_err
+        scores[sign] = round(total, 4)
+
+    best_sign = 1.0 if scores[1.0] > scores[-1.0] else -1.0
+    return best_sign, {"scores": {"+1": scores[1.0], "-1": scores[-1.0]}, "chosen_sign": best_sign}
+
+
+def _mask_bbox_padded(mask, pad_ratio=0.12):
+    ys, xs = np.nonzero(mask > 0)
+    if len(xs) < 100:
+        return None
+    h, w = mask.shape[:2]
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    px = int((x1 - x0) * pad_ratio) + 8
+    py = int((y1 - y0) * pad_ratio) + 8
+    return max(0, x0 - px), max(0, y0 - py), min(w, x1 + px), min(h, y1 + py)
+
+
+def _extract_sift_in_mask(color_img, mask, bbox, sift):
+    """Trích đặc trưng SIFT CHỈ nằm bên trong lõi mask (co 5px để loại 100% nền/màn hình sau)."""
+    x0, y0, x1, y1 = bbox
+    gray = cv2.cvtColor(color_img[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+    m_crop = (mask[y0:y1, x0:x1] > 0).astype(np.uint8) * 255
+    # Co 5px vào trong thân vật thể để tránh bắt nhầm chữ/viền nền ở mép mask
+    erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    m_inner = cv2.erode(m_crop, erode_k, iterations=1)
+    if np.count_nonzero(m_inner) < 200:
+        m_inner = m_crop
+    kps, desc = sift.detectAndCompute(gray, m_inner)
+    return kps, desc
+
+
+def find_turntable_loop_frame(valid_candidates, color_np, masks, min_fraction=0.35):
+    """Tìm chính xác frame quay hết 1 vòng 360° về trùng frame 0 bằng:
+    1. Fixed-Box Mask IoU (không tự co giãn từng frame -> bắt chính xác vị trí & kích thước quai).
+    2. SIFT feature matching trong lõi mask kèm kiểm tra nhất quán tọa độ (bắt họa tiết/logo, loại mặt lưng trơn).
+    """
+    n = len(valid_candidates)
+    if n < 20:
+        return None, {"reason": "too_few_frames"}
+
+    ref_idx = valid_candidates[0]
+    ref_mask = masks[ref_idx]
+    bbox = _mask_bbox_padded(ref_mask)
+    if bbox is None:
+        return None, {"reason": "invalid_ref_mask"}
+    x0, y0, x1, y1 = bbox
+    box_diag = math.hypot(x1 - x0, y1 - y0)
+
+    ref_m_crop = cv2.resize(
+        (ref_mask[y0:y1, x0:x1] > 0).astype(np.uint8), (128, 128), interpolation=cv2.INTER_NEAREST
+    ) > 0
+
+    try:
+        sift = cv2.SIFT_create(nfeatures=400)
+        bf = cv2.BFMatcher(cv2.NORM_L2)
+        use_sift = True
+    except Exception:
+        sift = cv2.ORB_create(nfeatures=400)
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+        use_sift = False
+
+    ref_kps, ref_desc = _extract_sift_in_mask(color_np[ref_idx], ref_mask, bbox, sift)
+    has_ref_tex = (ref_desc is not None and len(ref_kps) >= 8)
+
+    # Ảnh cạnh (Sobel gradient) phòng trường hợp vật thể trơn hoàn toàn không có SIFT
+    ref_gray = cv2.cvtColor(color_np[ref_idx][y0:y1, x0:x1], cv2.COLOR_BGR2GRAY).astype(np.float32)
+    ref_grad = cv2.magnitude(cv2.Sobel(ref_gray, cv2.CV_32F, 1, 0, ksize=3),
+                             cv2.Sobel(ref_gray, cv2.CV_32F, 0, 1, ksize=3))
+    ref_grad = cv2.resize(ref_grad, (128, 128), interpolation=cv2.INTER_AREA)
+
+    start_pos = max(15, int(n * min_fraction))
+    scores = []
+    match_counts = []
+    iou_list = []
+
+    for pos in range(start_pos, n):
+        idx = valid_candidates[pos]
+        m_full = masks[idx]
+        if m_full is None:
+            scores.append(-1.0)
+            match_counts.append(0)
+            iou_list.append(0.0)
+            continue
+
+        # 1. Fixed-Box Mask IoU (giữ nguyên tỷ lệ gốc, không phóng to khi mất quai)
+        m_crop = cv2.resize(
+            (m_full[y0:y1, x0:x1] > 0).astype(np.uint8), (128, 128), interpolation=cv2.INTER_NEAREST
+        ) > 0
+        inter = np.logical_and(ref_m_crop, m_crop)
+        union = np.logical_or(ref_m_crop, m_crop)
+        fixed_iou = float(np.count_nonzero(inter)) / max(1, int(np.count_nonzero(union)))
+
+        # 2. Khớp đặc trưng SIFT trong lõi mask kèm lọc khoảng cách dịch chuyển
+        spatial_matches = 0
+        if has_ref_tex:
+            kps, desc = _extract_sift_in_mask(color_np[idx], m_full, bbox, sift)
+            if desc is not None and len(kps) >= 6:
+                raw_matches = bf.knnMatch(ref_desc, desc, k=2)
+                max_disp = 0.14 * box_diag  # Điểm trên họa tiết phải quay về đúng vị trí cũ
+                for pair in raw_matches:
+                    if len(pair) < 2:
+                        continue
+                    m1, m2 = pair
+                    if m1.distance < (0.75 if use_sift else 0.80) * m2.distance:
+                        p1 = ref_kps[m1.queryIdx].pt
+                        p2 = kps[m1.trainIdx].pt
+                        if math.hypot(p1[0] - p2[0], p1[1] - p2[1]) <= max_disp:
+                            spatial_matches += 1
+
+        if has_ref_tex:
+            feat_score = min(1.0, float(spatial_matches) / max(12.0, 0.25 * len(ref_kps)))
+            score = 0.40 * fixed_iou + 0.60 * feat_score
+        else:
+            g = cv2.cvtColor(color_np[idx][y0:y1, x0:x1], cv2.COLOR_BGR2GRAY).astype(np.float32)
+            grad = cv2.magnitude(cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3),
+                                 cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3))
+            grad = cv2.resize(grad, (128, 128), interpolation=cv2.INTER_AREA)
+            if np.count_nonzero(inter) >= 50:
+                v1 = ref_grad[inter] - ref_grad[inter].mean()
+                v2 = grad[inter] - grad[inter].mean()
+                denom = float(np.linalg.norm(v1) * np.linalg.norm(v2))
+                grad_ncc = max(0.0, float(np.dot(v1, v2) / denom)) if denom > 1e-6 else 0.0
+            else:
+                grad_ncc = 0.0
+            score = 0.65 * fixed_iou + 0.35 * grad_ncc
+
+        scores.append(score)
+        match_counts.append(spatial_matches)
+        iou_list.append(fixed_iou)
+
+    if not scores:
+        return None, {"reason": "empty_search"}
+
+    scores_arr = np.asarray(scores, dtype=np.float64)
+    if len(scores_arr) >= 5:
+        smooth_scores = np.convolve(scores_arr, np.array([0.25, 0.5, 0.25]), mode="same")
+    else:
+        smooth_scores = scores_arr
+
+    best_offset = int(np.argmax(smooth_scores))
+    best_score = float(smooth_scores[best_offset])
+    best_pos = start_pos + best_offset
+    best_frame = valid_candidates[best_pos]
+
+    if best_score < 0.62:
+        return None, {
+            "reason": "no_clear_360_match",
+            "best_frame": int(best_frame),
+            "best_score": round(best_score, 4),
+            "best_matches": int(match_counts[best_offset]),
+            "best_iou": round(iou_list[best_offset], 4),
+        }
+
+    return best_pos, {
+        "reason": "matched_360_loop_sift_iou",
+        "loop_pos": int(best_pos),
+        "loop_frame": int(best_frame),
+        "total_candidates": int(n),
+        "score": round(best_score, 4),
+        "sift_matches": int(match_counts[best_offset]),
+        "fixed_iou": round(iou_list[best_offset], 4),
+    }
+
+
 def refine_timed_turntable_yaw(source, reference, feature_source, feature_reference,
-                                source_pivot, target_pivot, axis, expected_yaw, args):
-    if len(source.points) < 100 or len(reference.points) < 100:
-        return turntable_pose_between(source_pivot, target_pivot, axis, -expected_yaw), {
-            "yaw_deg": round(float(expected_yaw), 3), "reason": "time_prior_too_few_points",
-            "feature_fitness": None, "rmse_mm": None}
-    correction_limit = min(18.0, max(6.0, args.turntable_max_step_deg * 0.75))
-    step = max(1.0, args.turntable_yaw_step_deg)
-    angles = np.arange(expected_yaw - correction_limit,
-                       expected_yaw + correction_limit + step * 0.5, step)
+                               pivot, axis, prev_yaw, expected_step, rot_sign, args):
+    """Ước lượng bước xoay 1-DoF cho bàn xoay tay: tìm bước tiến đơn điệu quanh prev_yaw
+    (cho phép dừng 0° hoặc quay nhanh tới ~14°/step, chặn ghì lùi trên thân trụ tròn).
+    """
+    src_pts = np.asarray(source.points)
+    ref_pts = np.asarray(reference.points)
+    expected_yaw = prev_yaw + expected_step
+    if len(src_pts) < 100 or len(ref_pts) < 100:
+        return turntable_pose(pivot, axis, float(expected_yaw)), {
+            "yaw_deg": round(float(expected_yaw), 3),
+            "step_deg": round(float(expected_step), 3),
+            "reason": "time_prior_too_few_points",
+            "fitness": None,
+            "rmse_mm": None,
+        }
+
+    src_cols = np.asarray(source.colors) if source.has_colors() else None
+    ref_cols = np.asarray(reference.colors) if reference.has_colors() else None
+    ref_tree = cKDTree(ref_pts)
+
+    use_feat = (len(feature_source.points) >= 35 and len(feature_reference.points) >= 35)
+    if use_feat:
+        f_src_pts = np.asarray(feature_source.points)
+        f_src_cols = np.asarray(feature_source.colors) if feature_source.has_colors() else None
+        f_ref_pts = np.asarray(feature_reference.points)
+        f_ref_cols = np.asarray(feature_reference.colors) if feature_reference.has_colors() else None
+        f_ref_tree = cKDTree(f_ref_pts)
+    else:
+        f_src_pts = f_src_cols = f_ref_cols = f_ref_tree = None
+
+    max_dist = min(0.008, float(args.turntable_max_correspondence))
+
+    def _eval_step(step_mag):
+        angle_deg = prev_yaw + rot_sign * step_mag
+        pose = turntable_pose(pivot, axis, float(angle_deg))
+        b_fit, b_rmse, b_col = _score_turntable_alignment(
+            src_pts, src_cols, ref_tree, ref_cols, pose, max_dist
+        )
+        if use_feat:
+            f_fit, _, _ = _score_turntable_alignment(
+                f_src_pts, f_src_cols, f_ref_tree, f_ref_cols, pose, max_dist * 1.25
+            )
+        else:
+            f_fit = 0.0
+
+        # Phạt nhẹ nếu lệch quá xa tốc độ quay trung bình, ưu tiên RMSE thấp + màu RGB + đặc trưng rìa
+        exp_mag = abs(expected_step)
+        prior_penalty = 0.008 * abs(step_mag - exp_mag)
+        score = (
+            0.80 * b_fit
+            + 0.55 * f_fit
+            - 45.0 * b_rmse
+            - 0.85 * b_col
+            - prior_penalty
+        )
+        return score, float(angle_deg), float(rot_sign * step_mag), pose, b_fit, b_rmse, b_col, f_fit
+
+    # Chỉ tìm bước tiến quanh tốc độ quay kỳ vọng [0.45*exp, 2.2*exp] để tránh kẹt ở 0° trên trụ tròn
+    exp_mag = abs(expected_step)
+    min_step_mag = max(0.0, 0.45 * exp_mag)
+    max_step_mag = min(16.0, max(8.0, 2.2 * exp_mag))
+    coarse_steps = np.arange(min_step_mag, max_step_mag + 0.5, 0.5)
+
     best = None
-    for angle in angles:
-        pose = turntable_pose_between(source_pivot, target_pivot, axis, -float(angle))
-        candidate = o3d.geometry.PointCloud(source)
-        candidate.transform(pose)
-        body_score = o3d.pipelines.registration.evaluate_registration(
-            candidate, reference, args.turntable_max_correspondence)
-        feature_score = None
-        if len(feature_source.points) >= 35 and len(feature_reference.points) >= 35:
-            feature_candidate = o3d.geometry.PointCloud(feature_source)
-            feature_candidate.transform(pose)
-            feature_score = o3d.pipelines.registration.evaluate_registration(
-                feature_candidate, feature_reference, args.turntable_max_correspondence)
-        
-        feature_fitness = float(feature_score.fitness) if feature_score is not None else 0.0
-        key = (feature_fitness, float(body_score.fitness),
-               -float(body_score.inlier_rmse), -0.01 * abs(float(angle) - expected_yaw))
-        if best is None or key > best[0]:
-            best = (key, float(angle), pose, body_score, feature_score)
-    _, angle, pose, body_score, feature_score = best
+    for s in coarse_steps:
+        res = _eval_step(float(s))
+        if best is None or res[0] > best[0]:
+            best = res
+
+    # Quét mịn 0.25° quanh bước tốt nhất
+    best_step_mag = abs(best[2])
+    fine_lo = max(min_step_mag, best_step_mag - 0.5)
+    fine_hi = min(max_step_mag, best_step_mag + 0.5)
+    for s in np.arange(fine_lo, fine_hi + 0.125, 0.25):
+        res = _eval_step(float(s))
+        if res[0] > best[0]:
+            best = res
+
+    _, angle, signed_step, pose, b_fit, b_rmse, b_col, f_fit = best
     return pose, {
-        "yaw_deg": round(angle, 3), "expected_yaw_deg": round(float(expected_yaw), 3),
-        "yaw_correction_deg": round(angle - float(expected_yaw), 3),
-        "fitness": round(float(body_score.fitness), 4),
-        "rmse_mm": round(float(body_score.inlier_rmse) * 1000.0, 3),
-        "feature_fitness": round(float(feature_score.fitness), 4) if feature_score is not None else None,
-        "reason": "timed_handle_refinement",
+        "yaw_deg": round(angle, 3),
+        "step_deg": round(signed_step, 3),
+        "expected_yaw_deg": round(float(expected_yaw), 3),
+        "fitness": round(b_fit, 4),
+        "rmse_mm": round(b_rmse * 1000.0, 3),
+        "color_err": round(b_col, 4),
+        "feature_fitness": round(f_fit, 4) if use_feat else None,
+        "reason": "monotone_hand_turntable_refinement",
+    }
+
+
+def _project_delta_to_planar_3dof(T_delta, pivot, axis, max_dyaw_deg=12.0, max_shift_m=0.012):
+    """Chiếu ma trận chỉnh nhỏ T_delta về đúng 3-DoF phẳng trên mặt bàn:
+    - Xoay dyaw quanh (pivot, axis) giới hạn ±max_dyaw_deg
+    - Tịnh tiến ngang (dx, dz) vuông góc axis giới hạn <= max_shift_m
+    - Khóa cứng chiều cao dọc trục axis và góc nghiêng roll/pitch = 0.
+    """
+    R_d = T_delta[:3, :3]
+    t_d = T_delta[:3, 3]
+    axis = np.asarray(axis, dtype=np.float64)
+    axis = axis / max(np.linalg.norm(axis), 1e-8)
+    pivot = np.asarray(pivot, dtype=np.float64)
+
+    # Tách góc xoay quanh trục axis bằng vector trực giao u
+    ref = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    if abs(np.dot(ref, axis)) > 0.9:
+        ref = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    u = np.cross(axis, ref)
+    u /= np.linalg.norm(u)
+    v = R_d @ u
+    v_proj = v - np.dot(v, axis) * axis
+    v_norm = float(np.linalg.norm(v_proj))
+    if v_norm > 1e-6:
+        v_proj /= v_norm
+        sin_a = float(np.dot(np.cross(u, v_proj), axis))
+        cos_a = float(np.clip(np.dot(u, v_proj), -1.0, 1.0))
+        dyaw_deg = float(np.degrees(np.arctan2(sin_a, cos_a)))
+    else:
+        dyaw_deg = 0.0
+    dyaw_deg = float(np.clip(dyaw_deg, -max_dyaw_deg, max_dyaw_deg))
+
+    # Tách độ dịch tâm xoay và chỉ giữ thành phần ngang vuông góc axis
+    t_pivot = (R_d @ pivot + t_d) - pivot
+    t_horiz = t_pivot - np.dot(t_pivot, axis) * axis
+    shift_norm = float(np.linalg.norm(t_horiz))
+    if shift_norm > max_shift_m:
+        t_horiz = t_horiz * (max_shift_m / shift_norm)
+        shift_norm = max_shift_m
+
+    T_3dof = turntable_pose(pivot, axis, dyaw_deg)
+    T_3dof[:3, 3] += t_horiz
+    return T_3dof, dyaw_deg, shift_norm
+
+
+def refine_turntable_global_pass(active_indices, init_yaws, frame_clouds, frame_features,
+                                 pivot, axis, args,
+                                 max_dyaw_deg=12.0, max_shift_m=0.012,
+                                 exclude_radius=2, n_iters=2):
+    """Pass 2 (Leave-One-Out 3-DoF ICP):
+    Căn từng frame vào mô hình 360° ĐÃ LOẠI CHÍNH NÓ (và ±exclude_radius frame kề)
+    để bỏ tự thiên vị ở yaw0, đồng thời bù độ rơ xoay tay (dx, dz, dyaw).
+    Trả về (refined_poses_dict, diagnostics).
+    """
+    n_active = len(active_indices)
+    init_poses = {
+        f_idx: turntable_pose(pivot, axis, float(yaw))
+        for f_idx, yaw in zip(active_indices, init_yaws)
+    }
+    if n_active < 8:
+        return init_poses, {"refined": False, "reason": "too_few_frames"}
+
+    voxel = float(args.turntable_voxel)
+    icp_dist = max(0.008, voxel * 3.5)
+
+    # Chuẩn bị sẵn point + normal cục bộ cho từng frame (chỉ tính 1 lần)
+    local_data = {}
+    for f_idx in active_indices:
+        pcd = frame_clouds.get(f_idx)
+        if pcd is None or len(pcd.points) < 80:
+            continue
+        c = o3d.geometry.PointCloud(pcd)
+        if not c.has_normals():
+            c.estimate_normals(
+                o3d.geometry.KDTreeSearchParamHybrid(radius=voxel * 3.5, max_nn=25)
+            )
+            c.orient_normals_towards_camera_location(np.zeros(3))
+        local_data[f_idx] = (
+            np.asarray(c.points, dtype=np.float64),
+            np.asarray(c.normals, dtype=np.float64),
+        )
+
+    current_poses = {k: v.copy() for k, v in init_poses.items()}
+    total_yaw_shifts = []
+    total_xy_shifts_mm = []
+    accepted_count = 0
+
+    for _it in range(n_iters):
+        # Biến đổi tất cả các frame sang không gian world 1 lần cho vòng lặp này
+        world_pts_list = []
+        world_nrm_list = []
+        world_pos_ids = []
+        for pos, f_idx in enumerate(active_indices):
+            if f_idx not in local_data:
+                continue
+            pts_l, nrm_l = local_data[f_idx]
+            T = current_poses[f_idx]
+            R_m, t_v = T[:3, :3], T[:3, 3]
+            world_pts_list.append((pts_l @ R_m.T) + t_v)
+            world_nrm_list.append(nrm_l @ R_m.T)
+            world_pos_ids.append(np.full(len(pts_l), pos, dtype=np.int32))
+
+        if not world_pts_list:
+            break
+
+        all_pts = np.vstack(world_pts_list)
+        all_nrm = np.vstack(world_nrm_list)
+        all_ids = np.concatenate(world_pos_ids)
+
+        new_poses = {active_indices[0]: current_poses[active_indices[0]].copy()}
+        iter_yaw_shifts = []
+        iter_xy_shifts = []
+        iter_accepted = 0
+
+        for pos in range(1, n_active):
+            f_idx = active_indices[pos]
+            if f_idx not in local_data:
+                new_poses[f_idx] = current_poses[f_idx].copy()
+                continue
+
+            # Loại bỏ chính frame đang xét và ±exclude_radius frame lân cận (tính vòng tròn 360°)
+            dist_circ = np.minimum(np.abs(all_ids - pos), n_active - np.abs(all_ids - pos))
+            keep = dist_circ > exclude_radius
+            if int(np.count_nonzero(keep)) < 300:
+                new_poses[f_idx] = current_poses[f_idx].copy()
+                continue
+
+            ref_pcd = o3d.geometry.PointCloud()
+            ref_pcd.points = o3d.utility.Vector3dVector(all_pts[keep])
+            ref_pcd.normals = o3d.utility.Vector3dVector(all_nrm[keep])
+
+            pts_l, nrm_l = local_data[f_idx]
+            T_cur = current_poses[f_idx]
+            src_pcd = o3d.geometry.PointCloud()
+            src_pcd.points = o3d.utility.Vector3dVector((pts_l @ T_cur[:3, :3].T) + T_cur[:3, 3])
+            src_pcd.normals = o3d.utility.Vector3dVector(nrm_l @ T_cur[:3, :3].T)
+
+            reg = o3d.pipelines.registration.registration_icp(
+                src_pcd,
+                ref_pcd,
+                max_correspondence_distance=icp_dist,
+                init=np.eye(4),
+                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=15),
+            )
+
+            if float(reg.fitness) >= 0.45 and 1e-9 < float(reg.inlier_rmse) <= 0.009:
+                # Giới hạn tổng độ lệch so với pose khởi tạo Pass 1 để không bị trượt tích lũy
+                T_cand_world = reg.transformation @ T_cur
+                T_total_delta = T_cand_world @ np.linalg.inv(init_poses[f_idx])
+                T_3dof, dyaw, shift_m = _project_delta_to_planar_3dof(
+                    T_total_delta, pivot, axis,
+                    max_dyaw_deg=max_dyaw_deg, max_shift_m=max_shift_m
+                )
+                new_poses[f_idx] = T_3dof @ init_poses[f_idx]
+                iter_yaw_shifts.append(abs(dyaw))
+                iter_xy_shifts.append(shift_m * 1000.0)
+                iter_accepted += 1
+            else:
+                new_poses[f_idx] = T_cur.copy()
+
+        current_poses = new_poses
+        total_yaw_shifts = iter_yaw_shifts
+        total_xy_shifts_mm = iter_xy_shifts
+        accepted_count = iter_accepted
+
+    return current_poses, {
+        "refined": True,
+        "accepted_frames": f"{accepted_count}/{n_active - 1}",
+        "mean_dyaw_deg": round(float(np.mean(total_yaw_shifts)), 2) if total_yaw_shifts else 0.0,
+        "max_dyaw_deg": round(float(np.max(total_yaw_shifts)), 2) if total_yaw_shifts else 0.0,
+        "mean_shift_mm": round(float(np.mean(total_xy_shifts_mm)), 2) if total_xy_shifts_mm else 0.0,
+        "max_shift_mm": round(float(np.max(total_xy_shifts_mm)), 2) if total_xy_shifts_mm else 0.0,
     }
 
 def submap_cloud(indices, poses, color_np, depth_np, masks, intrinsic_tensor, voxel_size,

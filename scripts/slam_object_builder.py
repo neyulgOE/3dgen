@@ -373,18 +373,19 @@ def main():
     parser.add_argument("--manual-turntable", action="store_true")
     parser.add_argument("--turntable-yaw-mode", choices=["tracked", "uniform"], default="tracked")
     parser.add_argument("--turntable-camera-motion", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--turntable-axis", type=float, nargs=3, default=(0.0, 1.0, 0.0),
-                        metavar=("X", "Y", "Z"))
+    parser.add_argument("--turntable-axis", type=float, nargs=3, default=None,
+                        metavar=("X", "Y", "Z"),
+                        help="Trục quay thủ công; để trống sẽ tự ước lượng pháp tuyến mặt bàn bằng RANSAC")
     parser.add_argument("--turntable-pivot", type=float, nargs=3, default=None,
                         metavar=("X", "Y", "Z"))
     parser.add_argument("--turntable-max-step-deg", type=float, default=25.0)
     parser.add_argument("--turntable-yaw-step-deg", type=float, default=2.0)
     parser.add_argument("--turntable-voxel", type=float, default=0.0025)
-    parser.add_argument("--turntable-max-correspondence", type=float, default=0.012)
+    parser.add_argument("--turntable-max-correspondence", type=float, default=0.008)
     parser.add_argument("--turntable-min-fitness", type=float, default=0.35)
     parser.add_argument("--turntable-max-rmse", type=float, default=0.009)
     parser.add_argument("--turntable-min-feature-fitness", type=float, default=0.12)
-    parser.add_argument("--turntable-max-tracking-frames", type=int, default=72)
+    parser.add_argument("--turntable-max-tracking-frames", type=int, default=120)
     parser.add_argument("--sam2-model", type=str, default="sam2_hiera_small",
                         choices=["sam2_hiera_tiny", "sam2_hiera_small",
                                  "sam2_hiera_base_plus", "sam2_hiera_large"])
@@ -542,11 +543,11 @@ def main():
         _K = intrinsic.intrinsic_matrix
         depth_prefilter = DepthPreFilter(
             surface_smoothing=args.depth_prefilter_smoothing,
-            gap_filling=args.depth_prefilter_gapfill,
+            gap_filling=("off" if args.manual_turntable else args.depth_prefilter_gapfill),
             noise_removal="strong",
             outlier_removal_level=2,
             normal_outlier_removal=args.depth_prefilter_normal,
-            edge_artifact_removal=True,
+            edge_artifact_removal=(not args.manual_turntable),
             depth_min_mm=80.0,
             depth_max_mm=1200.0,
         )
@@ -596,58 +597,152 @@ def main():
         valid_candidates = [i for i, mask in enumerate(masks) if mask is not None]
         if not valid_candidates:
             raise RuntimeError("No reliable target masks were found.")
+
+        # 1. Tự tìm frame khép vòng 360° (cắt bỏ phần quay dư > 360° nếu có)
+        loop_pos, loop_info = find_turntable_loop_frame(valid_candidates, color_np, masks)
+        has_closed_loop = loop_pos is not None
+        if has_closed_loop:
+            print(f"   [Turntable] Phát hiện khép vòng 360° tại frame {valid_candidates[loop_pos]} "
+                  f"({loop_pos + 1}/{len(valid_candidates)} frames, score={loop_info['score']})")
+            valid_candidates = valid_candidates[:loop_pos + 1]
+        else:
+            print(f"   [Turntable] Chưa thấy rõ điểm khép vòng ({loop_info}), dùng toàn bộ {len(valid_candidates)} frames.")
+
         turn_start, turn_end = valid_candidates[0], valid_candidates[-1]
-        estimated_pivot, frame_pivots, pivot_info = estimate_turntable_pivots(
+
+        # 2. Ước lượng 1 tâm quay cố định duy nhất
+        estimated_pivot, _, pivot_info = estimate_turntable_pivots(
             valid_candidates, depth_np, masks, intrinsic)
-        pivot = np.asarray(args.turntable_pivot, dtype=np.float64) if args.turntable_pivot is not None else estimated_pivot
+        pivot = (np.asarray(args.turntable_pivot, dtype=np.float64)
+                 if args.turntable_pivot is not None else estimated_pivot)
+
+        # 3. Ước lượng trục quay từ mặt bàn bằng RANSAC (nếu không truyền --turntable-axis)
+        if args.turntable_axis is not None:
+            world_axis = np.asarray(args.turntable_axis, dtype=np.float64)
+            world_axis /= np.linalg.norm(world_axis)
+            print(f"   [Turntable] Dùng trục thủ công: {np.round(world_axis, 4).tolist()}")
+        else:
+            world_axis, axis_info = estimate_turntable_axis_from_table(
+                valid_candidates, depth_np, masks, intrinsic, pivot=pivot)
+            print(f"   [Turntable] Trục mặt bàn RANSAC: {np.round(world_axis, 4).tolist()} ({axis_info})")
+
         if len(valid_candidates) > args.turntable_max_tracking_frames:
             positions = np.linspace(0, len(valid_candidates) - 1,
                                     args.turntable_max_tracking_frames).round().astype(int)
             valid_candidates = [valid_candidates[p] for p in np.unique(positions)]
+
         camera_poses = [np.eye(4) for _ in range(n_frames)]
         if args.turntable_yaw_mode == "uniform" and args.turntable_camera_motion:
             camera_poses, camera_trusted, _ = estimate_turntable_camera_poses(
                 valid_candidates, rgbd_images, color_np, depth_np, masks, intrinsic_tensor, init_poses)
             valid_candidates = camera_trusted
+
         anchor = valid_candidates[0]
-        anchor_cloud = frame_point_cloud(anchor, color_np, depth_np, masks, intrinsic_tensor).voxel_down_sample(
-            args.turntable_voxel).cpu().to_legacy()
+        anchor_cloud = frame_point_cloud(
+            anchor, color_np, depth_np, masks, intrinsic_tensor
+        ).voxel_down_sample(args.turntable_voxel).cpu().to_legacy()
         if pivot is None:
             pivot = np.median(np.asarray(anchor_cloud.points), axis=0)
-        axis = np.asarray(args.turntable_axis, dtype=np.float64)
-        axis /= np.linalg.norm(axis)
+        canonical_pivot = pivot
+        print(f"   [Turntable] Pivot cố định: {np.round(canonical_pivot, 4).tolist()} | frames={len(valid_candidates)}")
+
         optimized_poses = [np.eye(4) for _ in range(n_frames)]
         timeline_span = max(1, turn_end - turn_start)
-        canonical_pivot = pivot
-        world_axis = axis
+
+        # 4. Tự động dò chiều quay (+1 / -1)
+        rot_sign, dir_info = detect_turntable_direction(
+            valid_candidates, color_np, depth_np, masks, intrinsic_tensor,
+            canonical_pivot, world_axis, turn_start, timeline_span, args)
+        print(f"   [Turntable] Chiều quay tự động: sign={rot_sign:+.0f} ({dir_info})")
+
         anchor_cloud_world = o3d.geometry.PointCloud(anchor_cloud)
         recent_clouds = [anchor_cloud_world]
         anchor_features = turntable_feature_cloud(anchor_cloud_world, canonical_pivot, world_axis)
         recent_feature_clouds = [anchor_features] if len(anchor_features.points) else []
+
         submaps, active = [], [anchor]
+        tracked_yaws = [0.0]
+        frame_clouds_cache = {anchor: anchor_cloud}
+        frame_features_cache = {anchor: anchor_features}
+        prev_index = anchor
+        prev_yaw = 0.0
+
         for index in valid_candidates[1:]:
-            expected_angle = 360.0 * (index - turn_start) / timeline_span
-            source_pivot = frame_pivots.get(index, pivot)
-            source_world = frame_point_cloud(index, color_np, depth_np, masks, intrinsic_tensor).voxel_down_sample(args.turntable_voxel).cpu().to_legacy()
+            expected_step = rot_sign * 360.0 * (index - prev_index) / timeline_span
+
+            source_world = frame_point_cloud(
+                index, color_np, depth_np, masks, intrinsic_tensor
+            ).voxel_down_sample(args.turntable_voxel).cpu().to_legacy()
+
             reference_cloud = o3d.geometry.PointCloud()
             for cloud in recent_clouds:
                 reference_cloud += cloud
-            feature_source = turntable_feature_cloud(source_world, source_pivot, world_axis)
+            reference_cloud = reference_cloud.voxel_down_sample(args.turntable_voxel)
+
+            feature_source = turntable_feature_cloud(source_world, canonical_pivot, world_axis)
+            frame_clouds_cache[index] = source_world
+            frame_features_cache[index] = feature_source
             feature_reference = o3d.geometry.PointCloud()
             for cloud in recent_feature_clouds:
                 feature_reference += cloud
-            pose, _ = refine_timed_turntable_yaw(
+            if len(feature_reference.points) > 0:
+                feature_reference = feature_reference.voxel_down_sample(args.turntable_voxel)
+
+            pose, yaw_diag = refine_timed_turntable_yaw(
                 source_world, reference_cloud, feature_source, feature_reference,
-                source_pivot, canonical_pivot, world_axis, expected_angle, args)
+                canonical_pivot, world_axis, prev_yaw, expected_step, rot_sign, args)
             if pose is None:
                 continue
+
             optimized_poses[index] = pose
             active.append(index)
+            prev_yaw = float(yaw_diag["yaw_deg"])
+            tracked_yaws.append(prev_yaw)
+            prev_index = index
+
             aligned_cloud = o3d.geometry.PointCloud(source_world)
             aligned_cloud.transform(pose)
             recent_clouds.append(aligned_cloud)
-            if len(recent_clouds) > 6:
+            # Chỉ giữ 2 frame liền trước để triệt tiêu hiệu ứng ghì lùi góc trên hình trụ tròn
+            if len(recent_clouds) > 2:
                 recent_clouds.pop(0)
+
+            if len(feature_source.points) >= 35:
+                aligned_features = o3d.geometry.PointCloud(feature_source)
+                aligned_features.transform(pose)
+                recent_feature_clouds.append(aligned_features)
+                if len(recent_feature_clouds) > 3:
+                    recent_feature_clouds.pop(0)
+
+        # 5. Khép vòng 1-DoF tỷ lệ về đúng ±360° (bảo toàn đoạn tay dừng, khử hoàn toàn trôi góc trên trụ tròn)
+        raw_total_yaw = tracked_yaws[-1] if tracked_yaws else 0.0
+        if has_closed_loop and abs(raw_total_yaw) > 120.0:
+            scale = (rot_sign * 360.0) / raw_total_yaw
+            closed_yaws = [y * scale for y in tracked_yaws]
+            print(f"   [Turntable] Khép vòng 1-DoF: tổng góc thô {raw_total_yaw:.1f}° "
+                  f"-> chuẩn hóa {rot_sign * 360.0:.1f}° (scale={scale:.3f}) trên {len(active)} frames.")
+
+            # 6. Pass 2: Leave-One-Out 3-DoF ICP bù độ rơ xoay tay (dx, dz, dyaw)
+            refined_poses_map, p2_info = refine_turntable_global_pass(
+                active, closed_yaws, frame_clouds_cache, frame_features_cache,
+                canonical_pivot, world_axis, args,
+                max_dyaw_deg=4.0, max_shift_m=0.005, exclude_radius=2, n_iters=2)
+            print(f"   [Turntable][Pass 2] Căn 3-DoF toàn cục 360°: {p2_info}")
+
+            for f_idx in active:
+                optimized_poses[f_idx] = refined_poses_map[f_idx]
+        elif has_closed_loop:
+            closed_yaws = [rot_sign * 360.0 * (f_idx - turn_start) / timeline_span for f_idx in active]
+            refined_poses_map, p2_info = refine_turntable_global_pass(
+                active, closed_yaws, frame_clouds_cache, frame_features_cache,
+                canonical_pivot, world_axis, args,
+                max_dyaw_deg=4.0, max_shift_m=0.005, exclude_radius=2, n_iters=2)
+            print(f"   [Turntable] Khép vòng 1-DoF (uniform fallback từ {raw_total_yaw:.1f}°): {p2_info}")
+            for f_idx in active:
+                optimized_poses[f_idx] = refined_poses_map[f_idx]
+        else:
+            print(f"   [Turntable] Tổng góc xoay ước lượng: {raw_total_yaw:.1f}° trên {len(active)}/{len(valid_candidates)} frames.")
+
         if active:
             submaps.append(active)
         trusted_indices = sorted(list(set(active)))
@@ -997,18 +1092,21 @@ def main():
 
     # ── 5. TSDF integration với masked depth ──────────────────────────────
     print("5. TSDF integration (masked depth) with Tensor API...")
+    tsdf_voxel = min(float(args.voxel), 0.0020) if args.manual_turntable else float(args.voxel)
     volume = o3d.t.geometry.VoxelBlockGrid(
         attr_names=['tsdf', 'weight', 'color'],
         attr_dtypes=[o3d.core.Dtype.Float32, o3d.core.Dtype.Float32, o3d.core.Dtype.Float32],
         attr_channels=[[1], [1], [3]],
-        voxel_size=args.voxel,
+        voxel_size=tsdf_voxel,
         block_resolution=16,
-        block_count=20000,
+        block_count=25000 if args.manual_turntable else 20000,
         device=O3D_DEVICE_GPU
     )
 
     integrated, skipped = 0, 0
     erode_px = max(0, int(getattr(args, "tsdf_mask_erode_px", 2)))
+    if args.manual_turntable:
+        erode_px = min(erode_px, 1)  # Không gọt mất quai cốc mỏng ở cự ly 45cm
     erode_kernel = (
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * erode_px + 1, 2 * erode_px + 1))
         if erode_px > 0
@@ -1060,14 +1158,15 @@ def main():
         depth_m[depth_m < lower_cut] = 0
         depth_m[depth_m > upper_cut] = 0
 
-        if args.depth_discontinuity_mm > 0:
+        disc_mm = (18.0 if args.manual_turntable else float(args.depth_discontinuity_mm))
+        if disc_mm > 0:
             _valid = (depth_m > 0).astype(np.uint8)
             _k = np.ones((3, 3), np.uint8)
             _filled = np.where(depth_m > 0, depth_m, np.float32(1e5))
             _dmin = cv2.erode(_filled, _k)
             _dmax = cv2.dilate(depth_m, _k)
             _span = _dmax - _dmin
-            depth_m[(_valid > 0) & (_span > args.depth_discontinuity_mm)] = 0
+            depth_m[(_valid > 0) & (_span > disc_mm)] = 0
 
         frame_lo = int(lower_cut)
         frame_hi = int(upper_cut)
@@ -1084,7 +1183,12 @@ def main():
 
         extrinsic = o3d.core.Tensor(np.linalg.inv(optimized_poses[i]), o3d.core.Dtype.Float64, O3D_DEVICE_CPU)
         frustum_block_coords = volume.compute_unique_block_coordinates(t_depth, intrinsic_tensor, extrinsic, 1000.0, depth_max_m)
-        volume.integrate(frustum_block_coords, t_depth, t_color, intrinsic_tensor, extrinsic, 1000.0, depth_max_m)
+        trunc_mult = 5.0 if args.manual_turntable else 8.0
+        volume.integrate(
+            frustum_block_coords, t_depth, t_color,
+            intrinsic_tensor, extrinsic, 1000.0, depth_max_m,
+            trunc_voxel_multiplier=trunc_mult,
+        )
 
         integrated += 1
 
@@ -1113,12 +1217,16 @@ def main():
     # KHÔNG gọi mesh.orient_triangles() vì Marching Cubes đã có hướng chuẩn theo gradient TSDF
     mesh.compute_vertex_normals()
 
-    required_view_support = 0 if args.manual_turntable else args.min_view_support
+    required_view_support = (
+        max(2, args.min_view_support)
+        if (args.manual_turntable and len(fuse_indices) >= 20)
+        else args.min_view_support
+    )
     if required_view_support > 0:
         before_support_filter = len(mesh.triangles)
         mesh, support = filter_mesh_by_view_support(
             mesh, fuse_indices, optimized_poses, depth_np, masks, intrinsic,
-            required_view_support, args.voxel * 3.0)
+            required_view_support, tsdf_voxel * 3.0)
         print(f"   Multi-view support filter: {before_support_filter:,} -> {len(mesh.triangles):,} triangles "
               f"(minimum {required_view_support} views)")
         if len(mesh.triangles) == 0:
@@ -1137,7 +1245,7 @@ def main():
             if len(cn) > 0:
                 before_components = len(cn)
                 before_triangles = len(mesh.triangles)
-                mesh, component_report = keep_geometrically_attached_components(mesh, args.voxel)
+                mesh, component_report = keep_geometrically_attached_components(mesh, tsdf_voxel)
                 print(f"   Components: {before_components}; kept {component_report['kept']} "
                       f"geometrically attached component(s), removed "
                       f"{component_report['removed_triangles']:,}/{before_triangles:,} triangles.")

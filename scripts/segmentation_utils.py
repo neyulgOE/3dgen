@@ -31,38 +31,51 @@ O3D_DEVICE_GPU = _resolve_compute_device()
 O3D_DEVICE_CPU = o3d.core.Device("CPU:0")
 
 def _find_prompt_frame(color_np, yolo_model, min_confidence=0.65):
-    """Tìm frame đầu tiên YOLO detect được object.
+    """Tìm frame đầu tiên YOLO detect được object với ngưỡng giảm dần.
     Trả về (frame_idx, points [[x,y],...], labels [1,...], bbox hoặc None).
     Point prompt là tâm YOLO bbox. Fallback về tâm ảnh frame 0 nếu YOLO fail.
     """
-    for idx, img in enumerate(color_np):
-        if yolo_model is None:
-            h, w = img.shape[:2]
-            return idx, [[w // 2, h // 2]], [1], None
-        res = yolo_model(img, verbose=False)
-        boxes = res[0].boxes
-        if boxes is None:
-            continue
-        best_area, best_box = -1, None
-        for i in range(len(boxes)):
-            conf = float(boxes.conf[i].item())
-            if int(boxes.cls[i].item()) == 0 and conf >= min_confidence:
-                b = boxes.xyxy[i].cpu().numpy().flatten()
-                area = (b[2] - b[0]) * (b[3] - b[1])
-                if area > best_area:
-                    best_area = area
-                    best_box = b
-        if best_box is not None:
-            cx = int((best_box[0] + best_box[2]) / 2)
-            cy = int((best_box[1] + best_box[3]) / 2)
-            return idx, [[cx, cy]], [1], [int(x) for x in best_box]
+    if yolo_model is None:
+        h, w = color_np[0].shape[:2]
+        return 0, [[w // 2, h // 2]], [1], None
+
+    thresholds = []
+    for thr in (float(min_confidence), 0.40, 0.25):
+        if thr not in thresholds and thr <= float(min_confidence) + 1e-6:
+            thresholds.append(thr)
+    if not thresholds:
+        thresholds = [float(min_confidence)]
+
+    for thr in thresholds:
+        for idx, img in enumerate(color_np):
+            res = yolo_model(img, verbose=False)
+            boxes = res[0].boxes
+            if boxes is None:
+                continue
+            best_area, best_box = -1, None
+            for i in range(len(boxes)):
+                conf = float(boxes.conf[i].item())
+                if int(boxes.cls[i].item()) == 0 and conf >= thr:
+                    b = boxes.xyxy[i].cpu().numpy().flatten()
+                    area = (b[2] - b[0]) * (b[3] - b[1])
+                    if area > best_area:
+                        best_area = area
+                        best_box = b
+            if best_box is not None:
+                cx = int((best_box[0] + best_box[2]) / 2)
+                cy = int((best_box[1] + best_box[3]) / 2)
+                if thr < float(min_confidence) - 1e-6:
+                    print(f"   SAM2: YOLO tìm thấy object ở frame {idx} với ngưỡng hạ thấp {thr:.2f}")
+                return idx, [[cx, cy]], [1], [int(x) for x in best_box]
+
     # Fallback
     h, w = color_np[0].shape[:2]
+    print("   SAM2 [WARN]: YOLO không tìm thấy object ở mọi ngưỡng -> fallback tâm frame 0.")
     return 0, [[w // 2, h // 2]], [1], None
 
 def segment_all_frames_sam2(color_np, sam2_predictor, yolo_model,
                              min_confidence=0.65, min_px=300):
-    """Segment toàn bộ frames bằng SAM2 VideoPredictor."""
+    """Segment toàn bộ frames bằng SAM2 VideoPredictor (1-frame overlap + add_new_mask)."""
     import torch
     import tempfile
     import shutil
@@ -72,81 +85,71 @@ def segment_all_frames_sam2(color_np, sam2_predictor, yolo_model,
 
     tmp_dir = tempfile.mkdtemp(prefix="sam2_frames_")
     try:
-        print(f"   SAM2: writing {n} frames to temp dir...")
+        print(f"   SAM2: writing {n} frames (BGR) to temp dir...")
         for i, img in enumerate(color_np):
-            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            cv2.imwrite(os.path.join(tmp_dir, f"{i:06d}.jpg"), rgb)
-
-        prompt_idx, pts, labels, yolo_box = _find_prompt_frame(
-            color_np, yolo_model, min_confidence)
-        print(f"   SAM2: prompt frame={prompt_idx}, points={pts}, yolo_box={yolo_box}")
+            # color_np từ dataset_io.py (cv2.imread) đã là BGR -> ghi thẳng cho cv2.imwrite
+            cv2.imwrite(os.path.join(tmp_dir, f"{i:06d}.jpg"), img)
 
         raw_masks = {}
         chunk_size = 150
-        
         last_chunk_mask = None
+
         for chunk_start in range(0, n, chunk_size):
             chunk_end = min(n, chunk_start + chunk_size)
-            chunk_n = chunk_end - chunk_start
-            
-            # Find prompt for this chunk
-            chunk_color_np = color_np[chunk_start:chunk_end]
-            
-            c_prompt_idx, pts, labels, yolo_box = _find_prompt_frame(
-                chunk_color_np, yolo_model, min_confidence)
-                
-            # If this is not the first chunk and YOLO failed (box is None), try to use the last mask
-            if chunk_start > 0 and yolo_box is None and last_chunk_mask is not None:
-                ys, xs = np.where(last_chunk_mask > 0)
-                if len(ys) > 0:
-                    pts = [[int(np.mean(xs)), int(np.mean(ys))]]
-                    c_prompt_idx = 0  # first frame of this chunk
-                    print(f"   SAM2 [Chunk {chunk_start}]: YOLO failed, using last mask centroid {pts}")
-            
-            print(f"   SAM2 [Chunk {chunk_start}-{chunk_end}]: prompt idx={c_prompt_idx}, pts={pts}, box={yolo_box}")
-            
-            # The files are named 000000.jpg to 000350.jpg, but SAM2 expects them to be in a directory.
-            # We can point sam2_predictor to a sub-directory containing just this chunk's frames,
-            # but sam2_predictor.init_state loads all images in the folder.
-            # So we create a chunk-specific temp dir!
+            use_overlap = (chunk_start > 0 and last_chunk_mask is not None)
+            actual_start = chunk_start - 1 if use_overlap else chunk_start
+
             chunk_tmp_dir = os.path.join(tmp_dir, f"chunk_{chunk_start}")
             os.makedirs(chunk_tmp_dir, exist_ok=True)
-            for i in range(chunk_start, chunk_end):
-                # Copy from the main tmp_dir or just rename? Let's just create symlinks or copy.
-                src = os.path.join(tmp_dir, f"{i:06d}.jpg")
-                dst = os.path.join(chunk_tmp_dir, f"{(i - chunk_start):06d}.jpg")
-                shutil.copy2(src, dst)
-            
+            for local_i, global_i in enumerate(range(actual_start, chunk_end)):
+                src = os.path.join(tmp_dir, f"{global_i:06d}.jpg")
+                dst = os.path.join(chunk_tmp_dir, f"{local_i:06d}.jpg")
+                os.symlink(src, dst)
+
             inference_state = sam2_predictor.init_state(video_path=chunk_tmp_dir)
             sam2_predictor.reset_state(inference_state)
-            
-            # BUG CŨ: yolo_box được tính (_find_prompt_frame trả về cả box),
-            # nhưng KHÔNG BAO GIỜ thực sự truyền cho SAM2 — chỉ point (tâm bbox)
-            # được dùng làm prompt. Một điểm mồi duy nhất khiến SAM2 dễ chỉ khoanh
-            # phần thân cốc (khối lớn, đặc) mà bỏ sót quai cốc (chi tiết mảnh, xa
-            # tâm điểm mồi) — đúng như các mask bị thiếu quai trong ảnh debug.
-            # Truyền thêm box giúp SAM2 biết rõ toàn bộ phạm vi vật thể ngay từ
-            # đầu, bao gồm cả quai.
-            box_arr = (np.array(yolo_box, dtype=np.float32) if yolo_box is not None else None)
-            sam2_predictor.add_new_points_or_box(
-                inference_state=inference_state,
-                frame_idx=c_prompt_idx,
-                obj_id=1,
-                points=np.array(pts, dtype=np.float32),
-                labels=np.array(labels, dtype=np.int32),
-                box=box_arr,
-            )
+
+            if use_overlap:
+                # Bám nối trực tiếp bằng đúng mask cuối của chunk trước (không cho YOLO nhảy vật khác)
+                c_prompt_idx = 0
+                pts, yolo_box = None, None
+                sam2_predictor.add_new_mask(
+                    inference_state=inference_state,
+                    frame_idx=0,
+                    obj_id=1,
+                    mask=(last_chunk_mask > 0),
+                )
+                print(f"   SAM2 [Chunk {chunk_start}-{chunk_end}]: nối tiếp bằng mask overlap từ frame {actual_start}")
+            else:
+                chunk_color_np = color_np[actual_start:chunk_end]
+                c_prompt_idx, pts, labels, yolo_box = _find_prompt_frame(
+                    chunk_color_np, yolo_model, min_confidence
+                )
+                box_arr = np.array(yolo_box, dtype=np.float32) if yolo_box is not None else None
+                sam2_predictor.add_new_points_or_box(
+                    inference_state=inference_state,
+                    frame_idx=c_prompt_idx,
+                    obj_id=1,
+                    points=np.array(pts, dtype=np.float32),
+                    labels=np.array(labels, dtype=np.int32),
+                    box=box_arr,
+                )
+                print(f"   SAM2 [Chunk {chunk_start}-{chunk_end}]: prompt idx={actual_start + c_prompt_idx}, pts={pts}, box={yolo_box}")
+
             for frame_idx, obj_ids, mask_logits in sam2_predictor.propagate_in_video(
                     inference_state, start_frame_idx=c_prompt_idx, reverse=False):
+                if use_overlap and frame_idx == 0:
+                    continue
                 obj_ids_list = obj_ids.tolist() if hasattr(obj_ids, 'tolist') else list(obj_ids)
                 if 1 in obj_ids_list:
                     idx = obj_ids_list.index(1)
                     m = (mask_logits[idx, 0].cpu().numpy() > 0.0).astype(np.uint8)
-                    raw_masks[chunk_start + frame_idx] = m
-                    
-            # Backward propagate
-            if c_prompt_idx > 0:
+                    raw_masks[actual_start + frame_idx] = m
+
+            # Backward propagate (chỉ cần khi khởi tạo mới bằng point/box ở giữa chunk)
+            if not use_overlap and c_prompt_idx > 0:
                 sam2_predictor.reset_state(inference_state)
+                box_arr = np.array(yolo_box, dtype=np.float32) if yolo_box is not None else None
                 sam2_predictor.add_new_points_or_box(
                     inference_state=inference_state,
                     frame_idx=c_prompt_idx,
@@ -158,14 +161,23 @@ def segment_all_frames_sam2(color_np, sam2_predictor, yolo_model,
                 for frame_idx, obj_ids, mask_logits in sam2_predictor.propagate_in_video(
                         inference_state, start_frame_idx=c_prompt_idx, reverse=True):
                     obj_ids_list = obj_ids.tolist() if hasattr(obj_ids, 'tolist') else list(obj_ids)
-                    if 1 in obj_ids_list and (chunk_start + frame_idx) not in raw_masks:
+                    global_idx = actual_start + frame_idx
+                    if 1 in obj_ids_list and global_idx not in raw_masks:
                         idx = obj_ids_list.index(1)
                         m = (mask_logits[idx, 0].cpu().numpy() > 0.0).astype(np.uint8)
-                        raw_masks[chunk_start + frame_idx] = m
-                        
-            # Save the last mask of this chunk for the next chunk
-            last_chunk_mask = raw_masks.get(chunk_end - 1, None)
-            
+                        raw_masks[global_idx] = m
+
+            # Lưu mask cuối của chunk hiện tại (đã kiểm tra min_px & đúng kích thước HxW)
+            cand_last = raw_masks.get(chunk_end - 1, None)
+            if cand_last is not None:
+                if cand_last.shape[:2] != (H, W):
+                    cand_last = cv2.resize(cand_last.astype(np.float32), (W, H),
+                                           interpolation=cv2.INTER_NEAREST)
+                    cand_last = (cand_last > 0.5).astype(np.uint8)
+                if np.count_nonzero(cand_last) < min_px:
+                    cand_last = None
+            last_chunk_mask = cand_last
+
             # Free chunk resources
             del inference_state
             torch.cuda.empty_cache()
@@ -173,7 +185,7 @@ def segment_all_frames_sam2(color_np, sam2_predictor, yolo_model,
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     masks = []
     for i in range(n):
         raw = raw_masks.get(i)
@@ -210,6 +222,8 @@ def segment_all_frames_sam2(color_np, sam2_predictor, yolo_model,
         return area, float(xs.mean()), float(ys.mean())
 
     stats = [_mask_stats(m) for m in masks]
+    valid_areas = [s[0] for s in stats if s is not None]
+    global_med_area = float(np.median(valid_areas)) if len(valid_areas) >= 10 else None
     window = 5  # số frame lân cận mỗi bên dùng để tính trung vị tham chiếu
     diag = math.hypot(W, H)
     rejected = 0
@@ -217,6 +231,15 @@ def segment_all_frames_sam2(color_np, sam2_predictor, yolo_model,
     for i in range(n):
         if stats[i] is None:
             continue
+        area, cx, cy = stats[i]
+        if global_med_area is not None:
+            g_ratio = area / max(global_med_area, 1.0)
+            if g_ratio > 3.5 or g_ratio < 0.20:
+                filtered_masks[i] = None
+                rejected += 1
+                print(f"      [Mask QC][Global] frame {i:03d}: loại bỏ mask lệch toàn cục "
+                      f"(global_area_ratio={g_ratio:.2f}) — nghi cắt nhầm đoạn.")
+                continue
         neighbor_stats = [stats[j] for j in range(max(0, i - window), min(n, i + window + 1))
                           if j != i and stats[j] is not None]
         if len(neighbor_stats) < 3:
@@ -226,7 +249,6 @@ def segment_all_frames_sam2(color_np, sam2_predictor, yolo_model,
         cys = np.array([s[2] for s in neighbor_stats])
         med_area = float(np.median(areas))
         med_cx, med_cy = float(np.median(cxs)), float(np.median(cys))
-        area, cx, cy = stats[i]
         area_ratio = area / max(med_area, 1.0)
         centroid_jump = math.hypot(cx - med_cx, cy - med_cy) / diag
         if area_ratio > 2.5 or area_ratio < 0.35 or centroid_jump > 0.35:

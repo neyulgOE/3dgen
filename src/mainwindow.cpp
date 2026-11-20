@@ -780,6 +780,34 @@ void MainWindow::setupUi() {
   meshEditVl->addWidget(_exportObjBtn);
   meshSidebarVl->addWidget(meshEditGroup);
 
+  // 2.5. Mesh-to-CAD Post-Processing (scripts/mesh_postprocess.py)
+  auto *ppGroup = new QGroupBox("✨ Hậu Xử Lý Mesh-to-CAD");
+  auto *ppVl = new QVBoxLayout(ppGroup);
+  ppVl->setContentsMargins(8, 8, 8, 8);
+  ppVl->setSpacing(5);
+
+  _ppSmoothCheck = new QCheckBox("Làm mịn giữ cạnh (Bilateral Normal)");
+  _ppSmoothCheck->setChecked(true);
+  _ppFillHolesCheck = new QCheckBox("Vá lỗ thủng cục bộ (Fairing cong)");
+  _ppFillHolesCheck->setChecked(true);
+  _ppCapBaseCheck = new QCheckBox("Bịt đáy phẳng (Delaunay 2D)");
+  _ppCapBaseCheck->setChecked(true);
+  _ppSolidifyCheck = new QCheckBox("Tạo độ dày thành 3mm (Solidify)");
+  _ppSolidifyCheck->setChecked(false);
+
+  _meshPostprocessBtn = new QPushButton("✨ Hậu Xử Lý CAD (mesh_postprocess)");
+  _meshPostprocessBtn->setStyleSheet(
+      "QPushButton { background: #0f766e; color: white; font-weight: bold; border-radius: 4px; padding: 7px 10px; }"
+      "QPushButton:hover { background: #0d9488; }"
+      "QPushButton:disabled { background: #141720; color: #475569; }");
+
+  ppVl->addWidget(_ppSmoothCheck);
+  ppVl->addWidget(_ppFillHolesCheck);
+  ppVl->addWidget(_ppCapBaseCheck);
+  ppVl->addWidget(_ppSolidifyCheck);
+  ppVl->addWidget(_meshPostprocessBtn);
+  meshSidebarVl->addWidget(ppGroup);
+
   // 3. File Management & Recent List
   auto *meshFileGroup = new QGroupBox("📂 Quản Lý File & Debug Stages");
   auto *meshFileVl = new QVBoxLayout(meshFileGroup);
@@ -1130,6 +1158,7 @@ void MainWindow::wireSelf() {
   connect(_meshUndoBtn,   &QPushButton::clicked, this, &MainWindow::onMeshUndo);
   connect(_meshSaveBtn,   &QPushButton::clicked, this, &MainWindow::onMeshSave);
   connect(_meshPoissonBtn,&QPushButton::clicked, this, &MainWindow::onMeshPoissonRecon);
+  connect(_meshPostprocessBtn, &QPushButton::clicked, this, &MainWindow::onMeshPostprocessClicked);
   connect(_meshRemoveBtn, &QPushButton::clicked, this, &MainWindow::onMeshRemoveFile);
   connect(_meshEraserBtn, &QPushButton::toggled, this, &MainWindow::onMeshEraserToggle);
   
@@ -2067,6 +2096,82 @@ void MainWindow::onMeshPoissonRecon()
     });
 }
 
+void MainWindow::onMeshPostprocessClicked()
+{
+    if (!_meshView->hasMesh()) {
+        QMessageBox::information(this, "Thông báo", "Chưa có Mesh đang mở để hậu xử lý!");
+        return;
+    }
+    QString plyPath = _meshView->loadedPath();
+    if (plyPath.isEmpty()) {
+        QMessageBox::warning(this, "Thông báo", "Hãy lưu file hiện tại xuống đĩa trước (bấm Lưu Mesh PLY).");
+        return;
+    }
+
+    QDir dir(QCoreApplication::applicationDirPath());
+    while (!dir.exists("scripts/mesh_postprocess.py") && !dir.isRoot()) {
+        dir.cdUp();
+    }
+    QString pyScript = dir.absoluteFilePath("scripts/mesh_postprocess.py");
+    if (!QFile::exists(pyScript)) {
+        QMessageBox::warning(this, "Lỗi", "Không tìm thấy script:\n" + pyScript);
+        return;
+    }
+
+    QFileInfo fi(plyPath);
+    QString outPath = fi.absolutePath() + "/" + fi.baseName() + "_cad.ply";
+
+    QStringList args;
+    args << pyScript << plyPath << "-o" << outPath;
+    if (_ppSmoothCheck && _ppSmoothCheck->isChecked()) {
+        args << "--bilateral-iters" << "6" << "--vertex-iters" << "12" << "--edge-angle-deg" << "28";
+    } else {
+        args << "--bilateral-iters" << "0";
+    }
+    args << ((_ppFillHolesCheck && _ppFillHolesCheck->isChecked()) ? "--fill-holes" : "--no-fill-holes");
+    args << ((_ppCapBaseCheck && _ppCapBaseCheck->isChecked()) ? "--cap-base" : "--no-cap-base");
+    if (_ppSolidifyCheck && _ppSolidifyCheck->isChecked()) {
+        args << "--solidify-mm" << "3.0";
+    }
+
+    _meshPostprocessBtn->setEnabled(false);
+    _meshPostprocessBtn->setText("⏳ Đang chạy Hậu Xử Lý CAD...");
+
+    QProcess *process = new QProcess(this);
+    process->setWorkingDirectory(dir.absolutePath());
+    process->setProcessChannelMode(QProcess::MergedChannels);
+    connect(process, &QProcess::readyReadStandardOutput, this, [this, process]() {
+        const QString out = QString::fromUtf8(process->readAllStandardOutput()).trimmed();
+        if (!out.isEmpty()) appendLog("[PostProcess] " + out);
+    });
+    process->start("python3", args);
+
+    connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, [this, process, outPath](int exitCode, QProcess::ExitStatus exitStatus) {
+        _meshPostprocessBtn->setEnabled(true);
+        _meshPostprocessBtn->setText("✨ Hậu Xử Lý CAD (mesh_postprocess)");
+
+        if (exitStatus == QProcess::NormalExit && exitCode == 0 && QFile::exists(outPath)) {
+            _meshView->loadMesh(outPath);
+            bool found = false;
+            for (int i = 0; i < _meshFileList->count(); ++i) {
+                if (_meshFileList->item(i)->data(Qt::UserRole).toString() == outPath) {
+                    found = true; break;
+                }
+            }
+            if (!found) {
+                auto *item = new QListWidgetItem(QFileInfo(outPath).fileName());
+                item->setData(Qt::UserRole, outPath);
+                _meshFileList->addItem(item);
+                _meshFileList->setCurrentItem(item);
+            }
+            appendLog("✅ Hậu xử lý Mesh-to-CAD xong: " + outPath);
+        } else {
+            QMessageBox::warning(this, "Lỗi", "Hậu xử lý CAD thất bại. Kiểm tra log để biết chi tiết.");
+        }
+        process->deleteLater();
+    });
+}
+
 void MainWindow::onMeshChanged(int triCount)
 {
     _meshInfoLbl->setText(QString("Tam giác: %1").arg(triCount));
@@ -2100,6 +2205,10 @@ void MainWindow::onKillProcessesClicked() {
     if (_buildMeshBtn2) {
         _buildMeshBtn2->setEnabled(true);
         _buildMeshBtn2->setText("🐍 Xây Mesh Object (AI)");
+    }
+    if (_meshPostprocessBtn) {
+        _meshPostprocessBtn->setEnabled(true);
+        _meshPostprocessBtn->setText("✨ Hậu Xử Lý CAD (mesh_postprocess)");
     }
     if (_meshPoissonBtn) {
         _meshPoissonBtn->setEnabled(true);

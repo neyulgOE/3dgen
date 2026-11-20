@@ -45,6 +45,7 @@ private slots:
     void onMeshSave           ();
     void onMeshExportObj      ();
     void onMeshPoissonRecon   ();
+    void onMeshPostprocessClicked();
     void onMeshRemoveFile     ();
     void onMeshChanged        (int triCount);
     void onMeshStatus         (const QString &msg);
@@ -114,6 +115,11 @@ private:
     QPushButton      *_meshSaveBtn    = nullptr;
     QPushButton      *_exportObjBtn   = nullptr;  // Export current PLY as OBJ
     QPushButton      *_meshPoissonBtn = nullptr;
+    QPushButton      *_meshPostprocessBtn = nullptr;
+    QCheckBox        *_ppSmoothCheck = nullptr;
+    QCheckBox        *_ppFillHolesCheck = nullptr;
+    QCheckBox        *_ppCapBaseCheck = nullptr;
+    QCheckBox        *_ppSolidifyCheck = nullptr;
     QPushButton      *_meshRemoveBtn  = nullptr;
     QLabel           *_meshInfoLbl    = nullptr;
     QListWidget      *_meshFileList   = nullptr;

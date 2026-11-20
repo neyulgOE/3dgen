@@ -352,7 +352,7 @@ def estimate_turntable_axis_from_table(indices, depth_np, masks, intrinsic, pivo
     inlier_ratio = float(len(inliers)) / max(1, len(pcd_bg.points))
     n = np.array(plane_model[:3], dtype=np.float64)
     n_norm = float(np.linalg.norm(n))
-    if n_norm < 1e-8 or len(inliers) < 400 or inlier_ratio < 0.45:
+    if n_norm < 1e-8 or len(inliers) < 500 or inlier_ratio < 0.15:
         return default_axis, {
             "reason": "weak_table_plane",
             "inliers": len(inliers),
@@ -365,8 +365,8 @@ def estimate_turntable_axis_from_table(indices, depth_np, masks, intrinsic, pivo
     if n[1] < 0:
         n = -n
 
-    # Kiểm tra độ nghiêng hợp lý (camera chúi tối đa 60° so với phương ngang => |ny| >= 0.5)
-    if n[1] < 0.50:
+    # Chốt an toàn: chỉ nhận mặt phẳng nghiêng tối đa 45° so với [0, 1, 0] để tránh bắt nhầm tường
+    if n[1] < 0.7071:
         return default_axis, {
             "reason": "plane_not_horizontal_table",
             "normal": [round(float(v), 4) for v in n],
@@ -744,20 +744,78 @@ def _project_delta_to_planar_3dof(T_delta, pivot, axis, max_dyaw_deg=12.0, max_s
     return T_3dof, dyaw_deg, shift_norm
 
 
+def smooth_and_enforce_monotonic_poses(active_indices, poses_map, pivot, axis, rot_sign):
+    """Làm mượt nhẹ và ép đơn điệu chuỗi góc yaw giữa 2 lượt Pass 2 để chặn trượt ngược ở mặt lưng trụ."""
+    if len(active_indices) < 3:
+        return poses_map
+
+    axis = np.asarray(axis, dtype=np.float64)
+    axis = axis / max(np.linalg.norm(axis), 1e-8)
+    pivot = np.asarray(pivot, dtype=np.float64)
+
+    ref = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    if abs(np.dot(ref, axis)) > 0.9:
+        ref = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    u = np.cross(axis, ref)
+    u /= np.linalg.norm(u)
+
+    raw_rads = []
+    horiz_shifts = []
+    for f_idx in active_indices:
+        T = poses_map[f_idx]
+        R_m, t_v = T[:3, :3], T[:3, 3]
+        v = R_m @ u
+        v_proj = v - np.dot(v, axis) * axis
+        v_norm = float(np.linalg.norm(v_proj))
+        if v_norm > 1e-6:
+            v_proj /= v_norm
+            sin_a = float(np.dot(np.cross(u, v_proj), axis))
+            cos_a = float(np.clip(np.dot(u, v_proj), -1.0, 1.0))
+            rad = float(np.arctan2(sin_a, cos_a))
+        else:
+            rad = 0.0
+        raw_rads.append(rad)
+        t_piv = (R_m @ pivot + t_v) - pivot
+        t_h = t_piv - np.dot(t_piv, axis) * axis
+        horiz_shifts.append(t_h)
+
+    yaws = np.degrees(np.unwrap(np.asarray(raw_rads, dtype=np.float64)))
+    # Làm mượt nhẹ [0.25, 0.5, 0.25] giữ nguyên 2 đầu
+    yaws_smooth = yaws.copy()
+    if len(yaws) >= 5:
+        yaws_smooth[1:-1] = 0.25 * yaws[:-2] + 0.5 * yaws[1:-1] + 0.25 * yaws[2:]
+
+    # Ép đơn điệu theo đúng chiều quay rot_sign
+    for k in range(1, len(yaws_smooth)):
+        if rot_sign * yaws_smooth[k] < rot_sign * yaws_smooth[k - 1]:
+            yaws_smooth[k] = yaws_smooth[k - 1]
+
+    out = {}
+    for f_idx, y_deg, t_h in zip(active_indices, yaws_smooth, horiz_shifts):
+        T_new = turntable_pose(pivot, axis, float(y_deg))
+        T_new[:3, 3] += t_h
+        out[f_idx] = T_new
+    return out
+
+
 def refine_turntable_global_pass(active_indices, init_yaws, frame_clouds, frame_features,
                                  pivot, axis, args,
                                  max_dyaw_deg=12.0, max_shift_m=0.012,
-                                 exclude_radius=2, n_iters=2):
+                                 exclude_radius=2, n_iters=2,
+                                 init_poses_override=None):
     """Pass 2 (Leave-One-Out 3-DoF ICP):
     Căn từng frame vào mô hình 360° ĐÃ LOẠI CHÍNH NÓ (và ±exclude_radius frame kề)
     để bỏ tự thiên vị ở yaw0, đồng thời bù độ rơ xoay tay (dx, dz, dyaw).
     Trả về (refined_poses_dict, diagnostics).
     """
     n_active = len(active_indices)
-    init_poses = {
-        f_idx: turntable_pose(pivot, axis, float(yaw))
-        for f_idx, yaw in zip(active_indices, init_yaws)
-    }
+    if init_poses_override is not None:
+        init_poses = {f_idx: init_poses_override[f_idx].copy() for f_idx in active_indices}
+    else:
+        init_poses = {
+            f_idx: turntable_pose(pivot, axis, float(yaw))
+            for f_idx, yaw in zip(active_indices, init_yaws)
+        }
     if n_active < 8:
         return init_poses, {"refined": False, "reason": "too_few_frames"}
 

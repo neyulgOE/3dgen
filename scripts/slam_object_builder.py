@@ -714,30 +714,39 @@ def main():
                 if len(recent_feature_clouds) > 3:
                     recent_feature_clouds.pop(0)
 
-        # 5. Khép vòng 1-DoF tỷ lệ về đúng ±360° (bảo toàn đoạn tay dừng, khử hoàn toàn trôi góc trên trụ tròn)
+        # 5. Khép vòng 1-DoF tỷ lệ về đúng ±360° (hoặc khởi tạo tuyến tính theo orig_idx nếu trượt > 15%)
         raw_total_yaw = tracked_yaws[-1] if tracked_yaws else 0.0
-        if has_closed_loop and abs(raw_total_yaw) > 120.0:
-            scale = (rot_sign * 360.0) / raw_total_yaw
-            closed_yaws = [y * scale for y in tracked_yaws]
-            print(f"   [Turntable] Khép vòng 1-DoF: tổng góc thô {raw_total_yaw:.1f}° "
-                  f"-> chuẩn hóa {rot_sign * 360.0:.1f}° (scale={scale:.3f}) trên {len(active)} frames.")
+        if has_closed_loop:
+            scale = (rot_sign * 360.0) / raw_total_yaw if abs(raw_total_yaw) > 120.0 else 999.0
+            if abs(scale - 1.0) > 0.15:
+                closed_yaws = [
+                    rot_sign * 360.0 * (f_idx - turn_start) / timeline_span
+                    for f_idx in active
+                ]
+                print(f"   [Turntable] Khởi tạo góc tuyến tính theo orig_idx (scale={scale:.3f}, "
+                      f"raw={raw_total_yaw:.1f}° -> ±360.0°) trên {len(active)} frames.")
+            else:
+                closed_yaws = [y * scale for y in tracked_yaws]
+                print(f"   [Turntable] Khép vòng 1-DoF: tổng góc thô {raw_total_yaw:.1f}° "
+                      f"-> chuẩn hóa {rot_sign * 360.0:.1f}° (scale={scale:.3f}) trên {len(active)} frames.")
 
-            # 6. Pass 2: Leave-One-Out 3-DoF ICP bù độ rơ xoay tay (dx, dz, dyaw)
-            refined_poses_map, p2_info = refine_turntable_global_pass(
+            # 6. Pass 2 (2 lượt): Lượt 1 thô (15° / 7mm) -> làm mượt/ép đơn điệu -> Lượt 2 tinh (4° / 3mm)
+            p1_poses_map, p2_r1_info = refine_turntable_global_pass(
                 active, closed_yaws, frame_clouds_cache, frame_features_cache,
                 canonical_pivot, world_axis, args,
-                max_dyaw_deg=4.0, max_shift_m=0.005, exclude_radius=2, n_iters=2)
-            print(f"   [Turntable][Pass 2] Căn 3-DoF toàn cục 360°: {p2_info}")
+                max_dyaw_deg=15.0, max_shift_m=0.007, exclude_radius=2, n_iters=1)
+            print(f"   [Turntable][Pass 2 - Round 1] {p2_r1_info}")
 
-            for f_idx in active:
-                optimized_poses[f_idx] = refined_poses_map[f_idx]
-        elif has_closed_loop:
-            closed_yaws = [rot_sign * 360.0 * (f_idx - turn_start) / timeline_span for f_idx in active]
-            refined_poses_map, p2_info = refine_turntable_global_pass(
-                active, closed_yaws, frame_clouds_cache, frame_features_cache,
+            smoothed_poses_map = smooth_and_enforce_monotonic_poses(
+                active, p1_poses_map, canonical_pivot, world_axis, rot_sign)
+
+            refined_poses_map, p2_r2_info = refine_turntable_global_pass(
+                active, None, frame_clouds_cache, frame_features_cache,
                 canonical_pivot, world_axis, args,
-                max_dyaw_deg=4.0, max_shift_m=0.005, exclude_radius=2, n_iters=2)
-            print(f"   [Turntable] Khép vòng 1-DoF (uniform fallback từ {raw_total_yaw:.1f}°): {p2_info}")
+                max_dyaw_deg=4.0, max_shift_m=0.003, exclude_radius=2, n_iters=1,
+                init_poses_override=smoothed_poses_map)
+            print(f"   [Turntable][Pass 2 - Round 2] {p2_r2_info}")
+
             for f_idx in active:
                 optimized_poses[f_idx] = refined_poses_map[f_idx]
         else:

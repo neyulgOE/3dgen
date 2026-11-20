@@ -1,0 +1,53 @@
+# Build output and IDE files
+build/
+debug/
+release/
+Makefile*
+*.o
+*.obj
+*.moc
+moc_*
+ui_*
+qrc_*
+.qmake.stash
+.qtcreator/
+*.pro.user*
+
+# Logs and runtime/debug outputs
+*.log
+*.pid
+*log*.txt
+edits_log*.txt
+opencv_build_log.txt
+*.ply
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+
+# Coding assistants & editor configs
+.agents/
+.codex/
+.vscode/
+.idea/
+
+# Large model weights and checkpoints (>100MB or binary models)
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.bin
+weights/
+
+# Precompiled dependencies and archives
+libs/
+*.zip
+*.tar.gz
+*.dll
+*.so
+*.dylib
+*.pdb

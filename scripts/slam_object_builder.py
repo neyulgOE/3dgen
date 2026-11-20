@@ -396,7 +396,7 @@ def main():
     parser.add_argument("--scene-tracking", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--scene-voxel", type=float, default=0.015)
     parser.add_argument("--scene-min-fitness", type=float, default=0.35)
-    parser.add_argument("--scene-max-rmse", type=float, default=0.018)
+    parser.add_argument("--scene-max-rmse", type=float, default=0.022)
     parser.add_argument("--scene-max-cycle-translation", type=float, default=0.025)
     parser.add_argument("--max-cycle-translation", type=float, default=0.012)
     parser.add_argument("--smooth-iters", type=int, default=20)
@@ -425,7 +425,7 @@ def main():
     parser.add_argument("--cotracker-n-points", type=int, default=96)
     parser.add_argument("--cotracker-min-inliers", type=int, default=8)
     parser.add_argument("--cotracker-inlier-thr-mm", type=float, default=10.0)
-    parser.add_argument("--min-view-support", type=int, default=0, help="Hạ về 0 để không bị xóa các mảng biên")
+    parser.add_argument("--min-view-support", type=int, default=2, help="Gọt sạch tam giác rác ở biên mask SAM2")
     parser.add_argument("--keyframe-translation", type=float, default=0.005)
     parser.add_argument("--keyframe-rotation", type=float, default=2.0)
     parser.add_argument("--keyframe-max-gap", type=int, default=15)
@@ -439,8 +439,8 @@ def main():
     parser.add_argument("--flatten-planes", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--flatten-max-planes", type=int, default=6)
     parser.add_argument("--flatten-distance-mm", type=float, default=3.5)
-    parser.add_argument("--flatten-normal-angle-deg", type=float, default=20.0)
-    parser.add_argument("--flatten-min-ratio", type=float, default=0.02)
+    parser.add_argument("--flatten-normal-angle-deg", type=float, default=15.0)
+    parser.add_argument("--flatten-min-ratio", type=float, default=0.05)
     parser.add_argument("--trim-support-plane", action=argparse.BooleanOptionalAction, default=False,
                         help="Tự động phát hiện mặt bàn đỡ dưới chân vật thể, cắt bỏ chân lem và bịt đáy phẳng.")
     parser.add_argument("--trim-support-margin-mm", type=float, default=4.0)
@@ -456,7 +456,7 @@ def main():
     parser.add_argument("--no-auto-merge-split", dest="auto_merge_split", action="store_false")
     parser.add_argument("--init-pose-file", type=str, default="")
     parser.add_argument("--depth-prefilter", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--depth-prefilter-smoothing", type=str, default="strong")
+    parser.add_argument("--depth-prefilter-smoothing", type=str, default="normal")
     parser.add_argument("--depth-prefilter-gapfill", type=str, default="normal")
     parser.add_argument("--depth-prefilter-normal", type=str, default="normal")
 
@@ -861,10 +861,12 @@ def main():
             depth_list=depth_np,
             init_poses=optimized_poses,
             intrinsic_o3d=intrinsic,
-            submap_size=10,
-            voxel_size=0.008,
+            masks=masks,             # Chỉ dùng để tự tính depth_trunc cận cảnh (0.55m - 0.85m)
+            submap_size=6,
+            voxel_size=0.007,
             depth_scale=1000.0,
-            depth_trunc=1.5,
+            depth_trunc=None,        # Tự động tính từ độ sâu thực tế của vật thể
+            refine_per_frame=True,   # Fine Point-to-Plane ICP từng frame vào Submap
             log_dir=recon_dir,
         )
 
@@ -1146,6 +1148,8 @@ def main():
             for _r in _flatten_reports:
                 print(f"    Plane {_r['plane']}: {_r['vertices']:,} vertices corrected, "
                       f"rms={_r['rms_correction_mm']}mm max={_r['max_correction_mm']}mm")
+        else:
+            print("    0 planes corrected (curved/non-planar surfaces preserved).")
 
     if args.trim_support_plane:
         print("\n8.6. Trimming table support plane & capping flat base...")

@@ -372,84 +372,187 @@ def filter_mesh_by_view_support(mesh, indices, poses, depth_np, masks, intrinsic
     return mesh, support
 
 
-def flatten_planar_regions(mesh, max_planes=6, ransac_distance_m=0.010,
-                           normal_angle_thresh_deg=20.0, min_cluster_ratio=0.02,
-                           min_cluster_size=300, ransac_n=3, num_iterations=2000):
-    vertices = np.asarray(mesh.vertices)
-    n_total = len(vertices)
-    if n_total < 500:
+def flatten_planar_regions(
+    mesh,
+    max_planes: int = 6,
+    ransac_distance_m: float = 0.0035,
+    normal_angle_thresh_deg: float = 15.0,
+    min_cluster_ratio: float = 0.05,
+    blend_alpha: float = 0.85,
+):
+    """
+    Làm phẳng tự thích nghi các bề mặt phẳng lớn (vách hộp) và TỰ ĐỘNG BỎ QUA
+    các bề mặt cong/trụ (thân cốc, chai lọ) nhờ:
+      1. Normal-Position Correlation Gate (|r| > 0.42)
+      2. Parabolic Arch / Sagitta Sign Test (> 1.0mm)
+    Chỉ đánh dấu loại trừ cụm đồng hướng pháp tuyến để bảo toàn cạnh 90° của hộp.
+    """
+    vertices = np.asarray(mesh.vertices).copy()
+    triangles = np.asarray(mesh.triangles)
+    n_verts = len(vertices)
+    if n_verts < 500 or len(triangles) < 500:
         return mesh, []
 
-    if not mesh.has_vertex_normals():
-        mesh.compute_vertex_normals()
-    normals = np.asarray(mesh.vertex_normals)
+    mesh.compute_vertex_normals()
+    normals = np.asarray(mesh.vertex_normals).copy()
 
-    pcd_full = o3d.geometry.PointCloud()
-    pcd_full.points = o3d.utility.Vector3dVector(vertices)
+    # Dựng danh sách kề đỉnh từ lưới tam giác để tìm miền liên thông thực sự
+    adj = [[] for _ in range(n_verts)]
+    for a, b, c in triangles:
+        ai, bi, ci = int(a), int(b), int(c)
+        adj[ai].extend((bi, ci))
+        adj[bi].extend((ai, ci))
+        adj[ci].extend((ai, bi))
 
-    min_size = max(min_cluster_size, int(min_cluster_ratio * n_total))
-    working_idx = np.arange(n_total)
-    cos_thresh = np.cos(np.radians(normal_angle_thresh_deg))
+    remaining_mask = np.ones(n_verts, dtype=bool)
+    min_verts = max(350, int(min_cluster_ratio * n_verts))
+    cos_thresh = float(np.cos(np.radians(normal_angle_thresh_deg)))
     reports = []
-    any_change = False
 
-    for plane_i in range(max_planes):
-        if len(working_idx) < min_size:
+    max_attempts = max_planes * 4
+    for _attempt in range(max_attempts):
+        if len(reports) >= max_planes:
             break
-        sub_pcd = pcd_full.select_by_index(working_idx)
+
+        rem_indices = np.where(remaining_mask)[0]
+        if len(rem_indices) < min_verts:
+            break
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(vertices[rem_indices])
         try:
-            plane_model, inlier_local = sub_pcd.segment_plane(
-                distance_threshold=ransac_distance_m, ransac_n=ransac_n,
-                num_iterations=num_iterations)
+            plane_model, inliers_local = pcd.segment_plane(
+                distance_threshold=ransac_distance_m,
+                ransac_n=3,
+                num_iterations=1000,
+            )
         except Exception:
             break
-        inlier_local = np.asarray(inlier_local)
-        if len(inlier_local) < min_size:
+
+        if len(inliers_local) < min_verts:
             break
-        inlier_global_raw = working_idx[inlier_local]
 
-        a, b, c, _d = plane_model
-        plane_normal = np.array([a, b, c])
-        norm_len = np.linalg.norm(plane_normal)
-        if norm_len < 1e-8:
-            working_idx = np.setdiff1d(working_idx, inlier_global_raw, assume_unique=False)
+        n_plane = np.array(plane_model[:3], dtype=np.float64)
+        n_norm = float(np.linalg.norm(n_plane))
+        if n_norm < 1e-8:
+            break
+        n_plane /= n_norm
+        d_plane = float(plane_model[3]) / n_norm
+
+        inlier_global = rem_indices[np.asarray(inliers_local, dtype=np.int64)]
+        dots = np.abs(normals[inlier_global] @ n_plane)
+        aligned_global = inlier_global[dots >= cos_thresh]
+
+        if len(aligned_global) < min_verts:
+            if len(aligned_global) > 0:
+                remaining_mask[aligned_global] = False
+            else:
+                remaining_mask[inlier_global] = False
             continue
-        plane_normal = plane_normal / norm_len
 
-        alignment = np.abs(normals[inlier_global_raw] @ plane_normal)
-        keep = alignment >= cos_thresh
-        inlier_global = inlier_global_raw[keep]
+        # Tìm thành phần liên thông lớn nhất trên mesh trong tập aligned_global
+        in_set = np.zeros(n_verts, dtype=bool)
+        in_set[aligned_global] = True
+        visited = np.zeros(n_verts, dtype=bool)
+        best_cluster = []
 
-        working_idx = np.setdiff1d(working_idx, inlier_global_raw, assume_unique=False)
+        for seed in aligned_global:
+            s = int(seed)
+            if visited[s]:
+                continue
+            comp = []
+            queue = [s]
+            visited[s] = True
+            while queue:
+                curr = queue.pop()
+                comp.append(curr)
+                for nb in adj[curr]:
+                    if in_set[nb] and not visited[nb]:
+                        visited[nb] = True
+                        queue.append(nb)
+            if len(comp) > len(best_cluster):
+                best_cluster = comp
 
-        if len(inlier_global) < min_size:
+        if len(best_cluster) < min_verts:
+            remaining_mask[aligned_global] = False
             continue
 
-        pts = vertices[inlier_global]
+        cluster_idx = np.array(best_cluster, dtype=np.int64)
+        remaining_mask[cluster_idx] = False
+
+        pts = vertices[cluster_idx]
+        nms = normals[cluster_idx]
+
+        if float(np.mean(nms @ n_plane)) < 0.0:
+            n_plane = -n_plane
+            d_plane = -d_plane
+
+        # ── KIỂM TRA HÌNH HỌC: MẶT PHẲNG THẬT (BOX) vs MẶT CONG/TRỤ (CỐC) ──
         centroid = pts.mean(axis=0)
-        _, _, vt = np.linalg.svd(pts - centroid, full_matrices=False)
-        fit_normal = vt[-1]
-        if np.dot(fit_normal, plane_normal) < 0:
-            fit_normal = -fit_normal
-        dist = (pts - centroid) @ fit_normal
-        rms_before_mm = float(np.sqrt(np.mean(dist ** 2))) * 1000.0
-        max_before_mm = float(np.max(np.abs(dist))) * 1000.0
-        # Giới hạn dịch chuyển tối đa 3.5mm để không kéo rách mép nối giữa các mặt
-        clamped_dist = np.clip(dist, -0.0035, 0.0035)
-        vertices[inlier_global] = pts - np.outer(clamped_dist, fit_normal)
-        any_change = True
+        centered = pts - centroid
+        pts_2d = centered - np.outer(centered @ n_plane, n_plane)
+        cov = (pts_2d.T @ pts_2d) / max(1, len(pts_2d))
+        _, eigvecs = np.linalg.eigh(cov)
+        u_major = eigvecs[:, 2]
+        u_minor = eigvecs[:, 1]
 
-        reports.append({
-            "plane": plane_i,
-            "vertices": int(len(inlier_global)),
-            "rms_correction_mm": round(rms_before_mm, 3),
-            "max_correction_mm": round(max_before_mm, 3),
-            "normal": fit_normal.tolist(),
-        })
+        # 1. Normal-Position Correlation Gate
+        is_curved_surface = False
+        for axis_vec in (u_minor, u_major):
+            coord = centered @ axis_vec
+            norm_proj = nms @ axis_vec
+            c_std = float(np.std(coord))
+            n_std = float(np.std(norm_proj))
+            if c_std > 0.005 and n_std > 0.04:
+                corr = float(np.corrcoef(coord, norm_proj)[0, 1])
+                if np.isfinite(corr) and abs(corr) > 0.42:
+                    is_curved_surface = True
+                    break
 
-    if any_change:
-        mesh.vertices = o3d.utility.Vector3dVector(vertices)
-        mesh.compute_vertex_normals()
+        # 2. Parabolic Arch / Sagitta Sign Test dọc theo trục ngang u_minor
+        if not is_curved_surface:
+            coord_minor = centered @ u_minor
+            span_minor = float(np.percentile(coord_minor, 95) - np.percentile(coord_minor, 5))
+            if span_minor > 0.012:
+                signed_dist = (pts @ n_plane) + d_plane
+                q_abs = np.abs(coord_minor)
+                inner_mask = q_abs <= np.percentile(q_abs, 35)
+                outer_mask = q_abs >= np.percentile(q_abs, 70)
+                if np.any(inner_mask) and np.any(outer_mask):
+                    arch_sagitta = float(
+                        np.median(signed_dist[inner_mask]) - np.median(signed_dist[outer_mask])
+                    )
+                    if abs(arch_sagitta) > 0.0010:
+                        is_curved_surface = True
+
+        if is_curved_surface:
+            continue
+
+        # ── LÀM PHẲNG MẶT PHẲNG THẬT KÈM FEATHERING BIÊN ───────────────────
+        cluster_set = set(best_cluster)
+        is_boundary = np.array(
+            [any(nb not in cluster_set for nb in adj[int(v)]) for v in cluster_idx],
+            dtype=bool,
+        )
+        weights = np.where(is_boundary, 0.35 * blend_alpha, blend_alpha)
+
+        signed_d = (pts @ n_plane) + d_plane
+        signed_d_clamped = np.clip(signed_d, -0.0035, 0.0035)
+        correction = np.outer(weights * signed_d_clamped, n_plane)
+        vertices[cluster_idx] = pts - correction
+
+        corr_mm = np.abs(weights * signed_d_clamped) * 1000.0
+        reports.append(
+            {
+                "plane": len(reports),
+                "vertices": int(len(cluster_idx)),
+                "rms_correction_mm": round(float(np.sqrt(np.mean(corr_mm ** 2))), 3),
+                "max_correction_mm": round(float(np.max(corr_mm)), 3),
+            }
+        )
+
+    mesh.vertices = o3d.utility.Vector3dVector(vertices)
+    mesh.compute_vertex_normals()
     return mesh, reports
 
 

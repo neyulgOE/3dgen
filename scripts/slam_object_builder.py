@@ -606,12 +606,15 @@ def main():
         if not valid_candidates:
             raise RuntimeError("No reliable target masks were found.")
 
-        # 1. Tự tìm frame khép vòng 360° (cắt bỏ phần quay dư > 360° nếu có)
-        loop_pos, loop_info = find_turntable_loop_frame(valid_candidates, color_np, masks)
+        # 1. Tự tìm frame khép vòng 360° bằng LightGlue 2D-3D (fallback Fixed-Box IoU + Sobel)
+        loop_pos, loop_info = find_turntable_loop_frame(
+            valid_candidates, color_np, masks,
+            depth_np=depth_np, intrinsic=intrinsic,
+        )
         has_closed_loop = loop_pos is not None
         if has_closed_loop:
             print(f"   [Turntable] Phát hiện khép vòng 360° tại frame {valid_candidates[loop_pos]} "
-                  f"({loop_pos + 1}/{len(valid_candidates)} frames, score={loop_info['score']})")
+                  f"({loop_pos + 1}/{len(valid_candidates)} frames, {loop_info})")
             valid_candidates = valid_candidates[:loop_pos + 1]
         else:
             print(f"   [Turntable] Chưa thấy rõ điểm khép vòng ({loop_info}), dùng toàn bộ {len(valid_candidates)} frames.")
@@ -1238,12 +1241,8 @@ def main():
 
     print(f"   Done: integrated={integrated} skipped={skipped}")
 
-    # Bước 5.5: GPU Pure Silhouette Carving (mặc định chỉ chạy cho --manual-turntable)
-    enable_silhouette_carve = (
-        bool(args.voxel_clipping)
-        if args.voxel_clipping is not None
-        else bool(args.manual_turntable)
-    )
+    # Bước 5.5: GPU Pure Silhouette Carving (tắt mặc định, chỉ bật thủ công cho bàn xoay điện)
+    enable_silhouette_carve = bool(args.voxel_clipping)
     if enable_silhouette_carve:
         from voxel_refiner import carve_tsdf_by_silhouette
         print(f"5.5. GPU Silhouette Carving (K={args.voxel_keyframes}, "

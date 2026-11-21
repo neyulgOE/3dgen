@@ -855,136 +855,259 @@ def _extract_sift_in_mask(color_img, mask, bbox, sift):
     return kps, desc
 
 
-def find_turntable_loop_frame(valid_candidates, color_np, masks, min_fraction=0.35):
-    """Tìm chính xác frame quay hết 1 vòng 360° về trùng frame 0 bằng:
-    1. Fixed-Box Mask IoU (không tự co giãn từng frame -> bắt chính xác vị trí & kích thước quai).
-    2. SIFT feature matching trong lõi mask kèm kiểm tra nhất quán tọa độ (bắt họa tiết/logo, loại mặt lưng trơn).
+def _prepare_object_only_rgb(rgb: np.ndarray, mask: np.ndarray):
+    """Che sạch hậu cảnh tĩnh bằng màu trung vị của vật thể (tránh tạo viền đen giả
+    thu hút SuperPoint) và trả về thêm mask co 2px để lọc flying pixels khi nâng 3D.
+    """
+    mask_u8 = (mask > 0).astype(np.uint8)
+    k_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask_eroded = cv2.erode(mask_u8, k_erode, iterations=1)
+    if int(np.count_nonzero(mask_eroded)) < 200:
+        mask_eroded = mask_u8
+
+    obj_pixels = rgb[mask_u8 > 0]
+    fill_val = np.median(obj_pixels, axis=0).astype(np.uint8) if len(obj_pixels) > 0 else np.array([128, 128, 128], dtype=np.uint8)
+    rgb_obj = np.empty_like(rgb)
+    rgb_obj[:] = fill_val
+    rgb_obj[mask_u8 > 0] = rgb[mask_u8 > 0]
+    return rgb_obj, mask_eroded
+
+
+def _sobel_ncc_in_box(rgb_a: np.ndarray, mask_a: np.ndarray, rgb_b: np.ndarray, mask_b: np.ndarray, box):
+    """Fallback nhẹ cho vật trơn hoàn toàn không có điểm đặc trưng LightGlue."""
+    x0, y0, x1, y1 = box
+    ga = cv2.cvtColor(rgb_a[y0:y1, x0:x1], cv2.COLOR_RGB2GRAY)
+    gb = cv2.cvtColor(rgb_b[y0:y1, x0:x1], cv2.COLOR_RGB2GRAY)
+    ga = cv2.resize(ga, (96, 96), interpolation=cv2.INTER_AREA)
+    gb = cv2.resize(gb, (96, 96), interpolation=cv2.INTER_AREA)
+    ma = cv2.resize((mask_a[y0:y1, x0:x1] > 0).astype(np.uint8), (96, 96), interpolation=cv2.INTER_NEAREST) > 0
+    mb = cv2.resize((mask_b[y0:y1, x0:x1] > 0).astype(np.uint8), (96, 96), interpolation=cv2.INTER_NEAREST) > 0
+    both = ma & mb
+    if int(np.count_nonzero(both)) < 80:
+        return 0.0
+
+    sa = np.hypot(cv2.Sobel(ga, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(ga, cv2.CV_32F, 0, 1, ksize=3))[both]
+    sb = np.hypot(cv2.Sobel(gb, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(gb, cv2.CV_32F, 0, 1, ksize=3))[both]
+    sa = sa - sa.mean()
+    sb = sb - sb.mean()
+    denom = float(np.linalg.norm(sa) * np.linalg.norm(sb))
+    return float(np.dot(sa, sb) / denom) if denom > 1e-6 else 0.0
+
+
+def find_turntable_loop_frame(
+    valid_candidates,
+    color_np,
+    masks,
+    depth_np=None,
+    intrinsic=None,
+    min_loop_frac: float = 0.40,
+    use_lightglue: bool = True,
+):
+    """Tìm chính xác frame khép vòng 360° cho chế độ bàn xoay:
+      - Tầng 1 (Coarse): Quét nhanh Fixed-Box Mask IoU toàn nửa sau chuỗi.
+      - Tầng 2 (Fine): Dùng LightGlueFeatureTracker (SuperPoint + LightGlue + 3D Kabsch-RANSAC)
+        trên ảnh đã che nền tĩnh để chọn đúng frame có góc xoay tương đối 3D -> 0° (độ chính xác ±1 frame).
+      - Fallback: Nếu vật trơn không đủ điểm LightGlue -> dùng Fixed-Box Mask IoU + Sobel NCC.
     """
     n = len(valid_candidates)
-    if n < 20:
-        return None, {"reason": "too_few_frames"}
+    if n < 40:
+        return None, {"reason": "too_few_frames", "n": n}
 
-    ref_idx = valid_candidates[0]
-    ref_mask = masks[ref_idx]
-    bbox = _mask_bbox_padded(ref_mask)
-    if bbox is None:
-        return None, {"reason": "invalid_ref_mask"}
-    x0, y0, x1, y1 = bbox
-    box_diag = math.hypot(x1 - x0, y1 - y0)
+    anchor_idx = valid_candidates[0]
+    m0 = masks[anchor_idx]
+    if m0 is None:
+        return None, {"reason": "missing_anchor_mask"}
 
-    ref_m_crop = cv2.resize(
-        (ref_mask[y0:y1, x0:x1] > 0).astype(np.uint8), (128, 128), interpolation=cv2.INTER_NEAREST
-    ) > 0
+    m0_bin = m0 > 0
+    ys0, xs0 = np.nonzero(m0_bin)
+    if len(xs0) < 100:
+        return None, {"reason": "empty_anchor_mask"}
 
-    try:
-        sift = cv2.SIFT_create(nfeatures=400)
-        bf = cv2.BFMatcher(cv2.NORM_L2)
-        use_sift = True
-    except Exception:
-        sift = cv2.ORB_create(nfeatures=400)
-        bf = cv2.BFMatcher(cv2.NORM_HAMMING)
-        use_sift = False
+    H, W = m0_bin.shape
+    pad_x = max(12, int(0.15 * (xs0.max() - xs0.min())))
+    pad_y = max(12, int(0.15 * (ys0.max() - ys0.min())))
+    box = (
+        max(0, int(xs0.min()) - pad_x),
+        max(0, int(ys0.min()) - pad_y),
+        min(W, int(xs0.max()) + pad_x),
+        min(H, int(ys0.max()) + pad_y),
+    )
+    x0, y0, x1, y1 = box
+    m0_crop = m0_bin[y0:y1, x0:x1]
 
-    ref_kps, ref_desc = _extract_sift_in_mask(color_np[ref_idx], ref_mask, bbox, sift)
-    has_ref_tex = (ref_desc is not None and len(ref_kps) >= 8)
-
-    # Ảnh cạnh (Sobel gradient) phòng trường hợp vật thể trơn hoàn toàn không có SIFT
-    ref_gray = cv2.cvtColor(color_np[ref_idx][y0:y1, x0:x1], cv2.COLOR_BGR2GRAY).astype(np.float32)
-    ref_grad = cv2.magnitude(cv2.Sobel(ref_gray, cv2.CV_32F, 1, 0, ksize=3),
-                             cv2.Sobel(ref_gray, cv2.CV_32F, 0, 1, ksize=3))
-    ref_grad = cv2.resize(ref_grad, (128, 128), interpolation=cv2.INTER_AREA)
-
-    start_pos = max(15, int(n * min_fraction))
-    scores = []
-    match_counts = []
-    iou_list = []
-
+    # ── Tầng 1: Quét nhanh Fixed-Box Mask IoU từ min_loop_frac trở đi ──────────
+    start_pos = max(20, int(n * float(min_loop_frac)))
+    ious = np.zeros(n, dtype=np.float32)
     for pos in range(start_pos, n):
-        idx = valid_candidates[pos]
-        m_full = masks[idx]
-        if m_full is None:
-            scores.append(-1.0)
-            match_counts.append(0)
-            iou_list.append(0.0)
+        mk = masks[valid_candidates[pos]]
+        if mk is None:
             continue
+        mk_crop = (mk[y0:y1, x0:x1] > 0)
+        inter = int(np.count_nonzero(m0_crop & mk_crop))
+        union = int(np.count_nonzero(m0_crop | mk_crop))
+        ious[pos] = float(inter) / float(max(union, 1))
 
-        # 1. Fixed-Box Mask IoU (giữ nguyên tỷ lệ gốc, không phóng to khi mất quai)
-        m_crop = cv2.resize(
-            (m_full[y0:y1, x0:x1] > 0).astype(np.uint8), (128, 128), interpolation=cv2.INTER_NEAREST
-        ) > 0
-        inter = np.logical_and(ref_m_crop, m_crop)
-        union = np.logical_or(ref_m_crop, m_crop)
-        fixed_iou = float(np.count_nonzero(inter)) / max(1, int(np.count_nonzero(union)))
+    cand_positions = np.arange(start_pos, n)
+    if len(cand_positions) == 0:
+        return None, {"reason": "empty_search_window"}
 
-        # 2. Khớp đặc trưng SIFT trong lõi mask kèm lọc khoảng cách dịch chuyển
-        spatial_matches = 0
-        if has_ref_tex:
-            kps, desc = _extract_sift_in_mask(color_np[idx], m_full, bbox, sift)
-            if desc is not None and len(kps) >= 6:
-                raw_matches = bf.knnMatch(ref_desc, desc, k=2)
-                max_disp = 0.14 * box_diag  # Điểm trên họa tiết phải quay về đúng vị trí cũ
-                for pair in raw_matches:
-                    if len(pair) < 2:
-                        continue
-                    m1, m2 = pair
-                    if m1.distance < (0.75 if use_sift else 0.80) * m2.distance:
-                        p1 = ref_kps[m1.queryIdx].pt
-                        p2 = kps[m1.trainIdx].pt
-                        if math.hypot(p1[0] - p2[0], p1[1] - p2[1]) <= max_disp:
-                            spatial_matches += 1
+    # Chọn tối đa 24 ứng viên thô trải đều trong vùng IoU cao nhất (top 30% hoặc IoU >= 0.72)
+    iou_vals = ious[cand_positions]
+    iou_cut = max(0.72, float(np.percentile(iou_vals, 75)))
+    high_pos = cand_positions[iou_vals >= iou_cut]
+    if len(high_pos) < 8:
+        top_k = min(24, len(cand_positions))
+        high_pos = np.sort(cand_positions[np.argsort(iou_vals)[-top_k:]])
 
-        if has_ref_tex:
-            feat_score = min(1.0, float(spatial_matches) / max(12.0, 0.25 * len(ref_kps)))
-            score = 0.40 * fixed_iou + 0.60 * feat_score
-        else:
-            g = cv2.cvtColor(color_np[idx][y0:y1, x0:x1], cv2.COLOR_BGR2GRAY).astype(np.float32)
-            grad = cv2.magnitude(cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3),
-                                 cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3))
-            grad = cv2.resize(grad, (128, 128), interpolation=cv2.INTER_AREA)
-            if np.count_nonzero(inter) >= 50:
-                v1 = ref_grad[inter] - ref_grad[inter].mean()
-                v2 = grad[inter] - grad[inter].mean()
-                denom = float(np.linalg.norm(v1) * np.linalg.norm(v2))
-                grad_ncc = max(0.0, float(np.dot(v1, v2) / denom)) if denom > 1e-6 else 0.0
-            else:
-                grad_ncc = 0.0
-            score = 0.65 * fixed_iou + 0.35 * grad_ncc
-
-        scores.append(score)
-        match_counts.append(spatial_matches)
-        iou_list.append(fixed_iou)
-
-    if not scores:
-        return None, {"reason": "empty_search"}
-
-    scores_arr = np.asarray(scores, dtype=np.float64)
-    if len(scores_arr) >= 5:
-        smooth_scores = np.convolve(scores_arr, np.array([0.25, 0.5, 0.25]), mode="same")
+    if len(high_pos) > 24:
+        pick = np.linspace(0, len(high_pos) - 1, 24).round().astype(int)
+        coarse_pos_list = [int(high_pos[p]) for p in np.unique(pick)]
     else:
-        smooth_scores = scores_arr
+        coarse_pos_list = [int(p) for p in high_pos]
 
-    best_offset = int(np.argmax(smooth_scores))
-    best_score = float(smooth_scores[best_offset])
-    best_pos = start_pos + best_offset
-    best_frame = valid_candidates[best_pos]
+    # ── Tầng 2: Xác minh 2D–3D bằng LightGlueFeatureTracker trên GPU ──────────
+    can_use_lg = bool(use_lightglue and depth_np is not None and intrinsic is not None)
+    if can_use_lg:
+        tracker = None
+        try:
+            from feature_tracker import LightGlueFeatureTracker, _rotation_angle_deg
 
-    if best_score < 0.62:
-        return None, {
-            "reason": "no_clear_360_match",
-            "best_frame": int(best_frame),
-            "best_score": round(best_score, 4),
-            "best_matches": int(match_counts[best_offset]),
-            "best_iou": round(iou_list[best_offset], 4),
+            K = np.asarray(intrinsic.intrinsic_matrix, dtype=np.float64)
+            tracker = LightGlueFeatureTracker(
+                max_keypoints=1024,
+                depth_scale=1000.0,
+                min_depth_m=0.08,
+                max_depth_m=1.50,
+            )
+
+            rgb0_obj, mask0_eroded = _prepare_object_only_rgb(color_np[anchor_idx], m0)
+            depth0 = depth_np[anchor_idx]
+            tracker.extract_and_cache(anchor_idx, rgb0_obj)
+
+            eval_cache = {}
+
+            def _eval_pos_lg(pos: int):
+                if pos in eval_cache:
+                    return eval_cache[pos]
+                f_idx = valid_candidates[pos]
+                mk = masks[f_idx]
+                dk = depth_np[f_idx]
+                if mk is None or dk is None:
+                    eval_cache[pos] = None
+                    return None
+
+                rgbk_obj, maskk_eroded = _prepare_object_only_rgb(color_np[f_idx], mk)
+                res = tracker.match_frames(
+                    src_id=f_idx,
+                    tgt_id=anchor_idx,
+                    rgb_src=rgbk_obj,
+                    depth_src=dk,
+                    rgb_tgt=rgb0_obj,
+                    depth_tgt=depth0,
+                    K=K,
+                    mask_src=maskk_eroded,
+                    mask_tgt=mask0_eroded,
+                    ransac_thresh_m=0.015,
+                    min_inliers=12,
+                )
+                if not res["ok"]:
+                    eval_cache[pos] = None
+                    return None
+
+                rot_deg = float(_rotation_angle_deg(res["T"]))
+                trans_mm = float(np.linalg.norm(res["T"][:3, 3])) * 1000.0
+                if rot_deg > 22.0 or trans_mm > 60.0:
+                    eval_cache[pos] = None
+                    return None
+
+                # Thưởng cực mạnh cho góc xoay tương đối tiến về 0° (chốt đúng mốc 360°)
+                angle_score = float(np.exp(-rot_deg / 6.0))
+                inlier_score = min(1.0, float(res["num_inliers"]) / 35.0) * float(res["inlier_ratio"])
+                iou_val = float(ious[pos])
+                score = 0.52 * angle_score + 0.30 * iou_val + 0.18 * inlier_score
+
+                entry = {
+                    "pos": pos,
+                    "frame": int(f_idx),
+                    "score": score,
+                    "rot_deg": rot_deg,
+                    "trans_mm": trans_mm,
+                    "lg_inliers": int(res["num_inliers"]),
+                    "inlier_ratio": float(res["inlier_ratio"]),
+                    "rmse_mm": float(res["rmse"]) * 1000.0,
+                    "fixed_iou": iou_val,
+                }
+                eval_cache[pos] = entry
+                return entry
+
+            # 2A. Đánh giá 24 ứng viên thô
+            best_coarse = None
+            for pos in coarse_pos_list:
+                entry = _eval_pos_lg(pos)
+                if entry is not None and (best_coarse is None or entry["score"] > best_coarse["score"]):
+                    best_coarse = entry
+
+            # 2B. Quét mịn từng frame (±18 frame) quanh đỉnh thô để chốt đúng mốc rot_deg ≈ 0°
+            if best_coarse is not None:
+                c_pos = best_coarse["pos"]
+                fine_lo = max(start_pos, c_pos - 18)
+                fine_hi = min(n - 1, c_pos + 18)
+                best_fine = best_coarse
+                for pos in range(fine_lo, fine_hi + 1):
+                    if ious[pos] < max(0.65, best_coarse["fixed_iou"] - 0.12):
+                        continue
+                    entry = _eval_pos_lg(pos)
+                    if entry is not None and entry["score"] > best_fine["score"]:
+                        best_fine = entry
+
+                if best_fine["rot_deg"] <= 10.0 and best_fine["fixed_iou"] >= 0.72 and best_fine["score"] >= 0.62:
+                    return best_fine["pos"], {
+                        "method": "lightglue_3d",
+                        "score": round(best_fine["score"], 4),
+                        "rot_deg": round(best_fine["rot_deg"], 2),
+                        "trans_mm": round(best_fine["trans_mm"], 2),
+                        "lg_inliers": best_fine["lg_inliers"],
+                        "rmse_mm": round(best_fine["rmse_mm"], 2),
+                        "fixed_iou": round(best_fine["fixed_iou"], 4),
+                    }
+        except Exception as exc:
+            print(f"   [Turntable][Loop] LightGlue fallback ({exc})")
+        finally:
+            if tracker is not None:
+                tracker.release()
+
+    # ── Fallback: Fixed-Box Mask IoU + Sobel Gradient NCC (vật trơn hoàn toàn) ─
+    best_fb_pos = None
+    best_fb_score = -1.0
+    best_fb_iou = 0.0
+    best_fb_ncc = 0.0
+
+    for pos in high_pos:
+        f_idx = valid_candidates[int(pos)]
+        mk = masks[f_idx]
+        if mk is None:
+            continue
+        iou_val = float(ious[int(pos)])
+        ncc_val = max(0.0, _sobel_ncc_in_box(color_np[anchor_idx], m0, color_np[f_idx], mk, box))
+        sc = 0.65 * iou_val + 0.35 * ncc_val
+        if sc > best_fb_score:
+            best_fb_score = sc
+            best_fb_pos = int(pos)
+            best_fb_iou = iou_val
+            best_fb_ncc = ncc_val
+
+    if best_fb_pos is not None and best_fb_iou >= 0.78 and best_fb_score >= 0.72:
+        return best_fb_pos, {
+            "method": "fallback_iou_sobel",
+            "score": round(best_fb_score, 4),
+            "fixed_iou": round(best_fb_iou, 4),
+            "sobel_ncc": round(best_fb_ncc, 4),
         }
 
-    return best_pos, {
-        "reason": "matched_360_loop_sift_iou",
-        "loop_pos": int(best_pos),
-        "loop_frame": int(best_frame),
-        "total_candidates": int(n),
-        "score": round(best_score, 4),
-        "sift_matches": int(match_counts[best_offset]),
-        "fixed_iou": round(iou_list[best_offset], 4),
+    return None, {
+        "method": "none",
+        "best_score": round(best_fb_score, 4),
+        "best_iou": round(best_fb_iou, 4),
     }
 
 
@@ -1370,6 +1493,7 @@ def flatten_planar_regions(
     normal_angle_thresh_deg: float = 18.0,
     min_cluster_ratio: float = 0.03,
     blend_alpha: float = 0.85,
+    include_plane_data: bool = False,
 ):
     """
     Làm phẳng tự thích nghi các mặt phẳng thật (kể cả mặt bên hẹp của Box) và
@@ -1535,14 +1659,17 @@ def flatten_planar_regions(
         vertices[cluster_idx] = pts - correction
 
         corr_mm = np.abs(weights * signed_d_clamped) * 1000.0
-        reports.append(
-            {
-                "plane": len(reports),
-                "vertices": int(len(cluster_idx)),
-                "rms_correction_mm": round(float(np.sqrt(np.mean(corr_mm ** 2))), 3),
-                "max_correction_mm": round(float(np.max(corr_mm)), 3),
-            }
-        )
+        rep = {
+            "plane": len(reports),
+            "vertices": int(len(cluster_idx)),
+            "rms_correction_mm": round(float(np.sqrt(np.mean(corr_mm ** 2))), 3),
+            "max_correction_mm": round(float(np.max(corr_mm)), 3),
+        }
+        if include_plane_data:
+            rep["normal"] = [float(v) for v in n_plane]
+            rep["d"] = float(d_plane)
+            rep["vertex_indices"] = cluster_idx.tolist()
+        reports.append(rep)
 
     mesh.vertices = o3d.utility.Vector3dVector(vertices)
     mesh.compute_vertex_normals()

@@ -795,6 +795,17 @@ void MainWindow::setupUi() {
   _ppSolidifyCheck = new QCheckBox("Tạo độ dày thành 3mm (Solidify)");
   _ppSolidifyCheck->setChecked(false);
 
+  _chkCadSnapEdges = new QCheckBox("Sắc cạnh mặt phẳng (Vector Edge Snap)");
+  _chkCadSnapEdges->setChecked(false);
+  _chkCadSnapEdges->setToolTip(
+      "Dựng giao tuyến sắc nét cho các mặt phẳng giao nhau (như hộp/chi tiết cơ khí). "
+      "Tự động bỏ qua vật cong như cốc và bảo vệ bo góc > 3mm.");
+
+  _chkCadAlignMm = new QCheckBox("Chuẩn hóa hệ CAD (+Z, đáy Z=0, mm)");
+  _chkCadAlignMm->setChecked(false);
+  _chkCadAlignMm->setToolTip(
+      "Xoay trục đứng về +Z, đặt đáy phẳng tại Z=0, đưa tâm (X,Y) về 0 và đổi đơn vị sang mm khi xuất CAD.");
+
   _meshPostprocessBtn = new QPushButton("✨ Hậu Xử Lý CAD (mesh_postprocess)");
   _meshPostprocessBtn->setStyleSheet(
       "QPushButton { background: #0f766e; color: white; font-weight: bold; border-radius: 4px; padding: 7px 10px; }"
@@ -805,6 +816,8 @@ void MainWindow::setupUi() {
   ppVl->addWidget(_ppFillHolesCheck);
   ppVl->addWidget(_ppCapBaseCheck);
   ppVl->addWidget(_ppSolidifyCheck);
+  ppVl->addWidget(_chkCadSnapEdges);
+  ppVl->addWidget(_chkCadAlignMm);
   ppVl->addWidget(_meshPostprocessBtn);
   meshSidebarVl->addWidget(ppGroup);
 
@@ -2141,6 +2154,12 @@ void MainWindow::onMeshPostprocessClicked()
     args << ((_ppCapBaseCheck && _ppCapBaseCheck->isChecked()) ? "--cap-base" : "--no-cap-base");
     if (_ppSolidifyCheck && _ppSolidifyCheck->isChecked()) {
         args << "--solidify-mm" << "3.0";
+    }
+    if (_chkCadSnapEdges && _chkCadSnapEdges->isChecked()) {
+        args << "--snap-planar-edges" << "--snap-radius-mm" << "3.0";
+    }
+    if (_chkCadAlignMm && _chkCadAlignMm->isChecked()) {
+        args << "--align-cad" << "--export-mm";
     }
 
     _meshPostprocessBtn->setEnabled(false);

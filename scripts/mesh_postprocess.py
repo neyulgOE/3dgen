@@ -236,6 +236,216 @@ def bilateral_normal_filter(
     return mesh
 
 
+# ── 2.5. Vector Planar Edge Snapping (Cạnh giao 2 mặt phẳng & Góc 3 mặt) ────
+
+def _solve_plane_intersection_line(n1: np.ndarray, d1: float, n2: np.ndarray, d2: float, ref_pt: np.ndarray):
+    """Giải đường giao tuyến 3D của 2 mặt phẳng n1·p + d1 = 0 và n2·p + d2 = 0.
+    Trả về (p0, l_unit) với p0 là điểm trên giao tuyến gần ref_pt nhất.
+    """
+    l_vec = np.cross(n1, n2)
+    l_norm = float(np.linalg.norm(l_vec))
+    if l_norm < 1e-6:
+        return None, None
+    l_unit = l_vec / l_norm
+
+    # Hệ 3x3 chốt vị trí dọc theo l_unit tại đúng mặt phẳng qua ref_pt
+    A = np.vstack([n1, n2, l_unit])
+    b = np.array([-d1, -d2, float(np.dot(l_unit, ref_pt))], dtype=np.float64)
+    try:
+        p0 = np.linalg.solve(A, b)
+    except np.linalg.LinAlgError:
+        return None, None
+    return p0, l_unit
+
+
+def _is_vertex_move_safe(vi: int, new_pos: np.ndarray, verts: np.ndarray, tris: np.ndarray, v_to_tris: list) -> bool:
+    """Kiểm tra dịch chuyển đỉnh vi -> new_pos không làm đảo chiều pháp tuyến hay suy biến tam giác kề."""
+    for fi in v_to_tris[vi]:
+        a, b, c = int(tris[fi, 0]), int(tris[fi, 1]), int(tris[fi, 2])
+        p0, p1, p2 = verts[a], verts[b], verts[c]
+        old_n = np.cross(p1 - p0, p2 - p0)
+        old_len = float(np.linalg.norm(old_n))
+        if old_len < 1e-12:
+            continue
+
+        q0 = new_pos if a == vi else p0
+        q1 = new_pos if b == vi else p1
+        q2 = new_pos if c == vi else p2
+        new_n = np.cross(q1 - q0, q2 - q0)
+        new_len = float(np.linalg.norm(new_n))
+        if new_len < 1e-10:
+            return False
+        if float(np.dot(old_n, new_n)) / (old_len * new_len) < 0.20:
+            return False
+    return True
+
+
+def snap_planar_intersections(
+    mesh: o3d.geometry.TriangleMesh,
+    max_planes: int = 6,
+    snap_radius_mm: float = 3.0,
+    min_dihedral_deg: float = 25.0,
+    max_dihedral_deg: float = 155.0,
+    adjacency_dist_mm: float = 12.0,
+):
+    """Tách các mặt phẳng thật (tự bỏ qua mặt cong/trụ), giải giao tuyến cạnh
+    l = n1 x n2 và đỉnh góc 3 mặt, sau đó kéo sắc các đỉnh dải chuyển tiếp
+    trong phạm vi <= snap_radius_mm (bảo vệ bo góc fillet thật).
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    from geometry_utils import flatten_planar_regions
+
+    mesh, planes = flatten_planar_regions(
+        mesh,
+        max_planes=max_planes,
+        blend_alpha=0.90,
+        include_plane_data=True,
+    )
+    if len(planes) < 2:
+        return mesh, {
+            "planes_detected": len(planes),
+            "edges_snapped": [],
+            "corners_snapped": 0,
+            "total_verts_snapped": 0,
+        }
+
+    verts = np.asarray(mesh.vertices, dtype=np.float64).copy()
+    tris = np.asarray(mesh.triangles, dtype=np.int64)
+    n_verts = len(verts)
+
+    adj = [set() for _ in range(n_verts)]
+    v_to_tris = [[] for _ in range(n_verts)]
+    for fi, (a, b, c) in enumerate(tris):
+        ai, bi, ci = int(a), int(b), int(c)
+        adj[ai].update((bi, ci))
+        adj[bi].update((ai, ci))
+        adj[ci].update((ai, bi))
+        v_to_tris[ai].append(fi)
+        v_to_tris[bi].append(fi)
+        v_to_tris[ci].append(fi)
+
+    # Phân biệt đỉnh lõi mặt phẳng (khóa cố định) vs đỉnh biên / chuyển tiếp (được phép snap)
+    plane_core_mask = np.zeros(n_verts, dtype=bool)
+    plane_trees = []
+    plane_sets = []
+    for p in planes:
+        v_ids = np.asarray(p["vertex_indices"], dtype=np.int64)
+        v_set = set(v_ids.tolist())
+        plane_sets.append(v_set)
+        plane_trees.append(cKDTree(verts[v_ids]))
+        for vi in v_ids:
+            if all(nb in v_set for nb in adj[int(vi)]):
+                plane_core_mask[int(vi)] = True
+
+    snap_radius_m = float(snap_radius_mm) / 1000.0
+    adj_dist_m = float(adjacency_dist_mm) / 1000.0
+    seam_band_m = max(snap_radius_m * 2.0, 0.006)
+
+    adjacent_pairs = set()
+    edge_reports = []
+    total_snapped = 0
+
+    # 1. Giải giao tuyến cho từng cặp mặt phẳng kề nhau
+    for i in range(len(planes)):
+        ni = np.asarray(planes[i]["normal"], dtype=np.float64)
+        di = float(planes[i]["d"])
+        pts_i = verts[planes[i]["vertex_indices"]]
+
+        for j in range(i + 1, len(planes)):
+            nj = np.asarray(planes[j]["normal"], dtype=np.float64)
+            dj = float(planes[j]["d"])
+
+            cos_ang = float(np.clip(np.dot(ni, nj), -1.0, 1.0))
+            dihedral_deg = float(np.degrees(np.arccos(cos_ang)))
+            if not (min_dihedral_deg <= dihedral_deg <= max_dihedral_deg):
+                continue
+
+            # Kiểm tra 2 cụm mặt phẳng có kề nhau trong không gian không
+            dists_ij, _ = plane_trees[j].query(pts_i, k=1)
+            near_i = pts_i[dists_ij <= adj_dist_m]
+            if len(near_i) < 10:
+                continue
+
+            adjacent_pairs.add((i, j))
+            ref_pt = near_i.mean(axis=0)
+            p0, l_unit = _solve_plane_intersection_line(ni, di, nj, dj, ref_pt)
+            if p0 is None:
+                continue
+
+            # Chọn đỉnh ứng viên nằm trong dải chuyển tiếp giữa 2 mặt phẳng
+            dist_pi = np.abs(verts @ ni + di)
+            dist_pj = np.abs(verts @ nj + dj)
+            cand_ids = np.nonzero((~plane_core_mask) & (dist_pi <= seam_band_m) & (dist_pj <= seam_band_m))[0]
+            if len(cand_ids) == 0:
+                continue
+
+            # Chỉ giữ đỉnh thực sự nằm gần ranh giới 2 cụm i và j
+            di_c, _ = plane_trees[i].query(verts[cand_ids], k=1)
+            dj_c, _ = plane_trees[j].query(verts[cand_ids], k=1)
+            cand_ids = cand_ids[(di_c <= adj_dist_m) & (dj_c <= adj_dist_m)]
+
+            snapped_this_edge = 0
+            for vi in cand_ids:
+                v = verts[int(vi)]
+                v_proj = p0 + float(np.dot(v - p0, l_unit)) * l_unit
+                move_dist = float(np.linalg.norm(v_proj - v))
+                if move_dist > snap_radius_m or move_dist < 1e-6:
+                    continue
+                if _is_vertex_move_safe(int(vi), v_proj, verts, tris, v_to_tris):
+                    verts[int(vi)] = v_proj
+                    snapped_this_edge += 1
+
+            total_snapped += snapped_this_edge
+            edge_reports.append({
+                "pair": f"P{i}-P{j}",
+                "dihedral_deg": round(dihedral_deg, 2),
+                "snapped_verts": snapped_this_edge,
+            })
+
+    # 2. Giải đỉnh góc 3 mặt phẳng đôi một kề nhau
+    corners_snapped = 0
+    for i in range(len(planes)):
+        for j in range(i + 1, len(planes)):
+            if (i, j) not in adjacent_pairs:
+                continue
+            for k in range(j + 1, len(planes)):
+                if (i, k) not in adjacent_pairs or (j, k) not in adjacent_pairs:
+                    continue
+                ni = np.asarray(planes[i]["normal"], dtype=np.float64)
+                nj = np.asarray(planes[j]["normal"], dtype=np.float64)
+                nk = np.asarray(planes[k]["normal"], dtype=np.float64)
+                A = np.vstack([ni, nj, nk])
+                if abs(float(np.linalg.det(A))) < 0.15:
+                    continue
+                b = np.array([-float(planes[i]["d"]), -float(planes[j]["d"]), -float(planes[k]["d"])], dtype=np.float64)
+                try:
+                    corner = np.linalg.solve(A, b)
+                except np.linalg.LinAlgError:
+                    continue
+
+                dists_corner = np.linalg.norm(verts - corner[None, :], axis=1)
+                near_c = np.nonzero((~plane_core_mask) & (dists_corner <= snap_radius_m))[0]
+                if len(near_c) == 0:
+                    continue
+                # Kéo đỉnh gần góc nhất lên đúng tọa độ góc CAD
+                best_vi = int(near_c[int(np.argmin(dists_corner[near_c]))])
+                if _is_vertex_move_safe(best_vi, corner, verts, tris, v_to_tris):
+                    verts[best_vi] = corner
+                    corners_snapped += 1
+                    total_snapped += 1
+
+    mesh.vertices = o3d.utility.Vector3dVector(verts)
+    mesh = _clean_mesh_topology(mesh)
+    return mesh, {
+        "planes_detected": len(planes),
+        "edges_snapped": edge_reports,
+        "corners_snapped": corners_snapped,
+        "total_verts_snapped": total_snapped,
+    }
+
+
 # ── 3. Phân loại vòng biên hở (Lỗ thủng / Đáy / Miệng hở) ──────────────────
 
 def classify_boundary_loops(
@@ -759,6 +969,10 @@ def main():
                         help="Xoay trục đứng về +Z, đặt đáy tại Z=0, đưa tâm (X, Y) về (0, 0)")
     parser.add_argument("--export-mm", action=argparse.BooleanOptionalAction, default=False,
                         help="Nhân tọa độ x1000 sang đơn vị mm khi xuất file CAD (.stl/.obj)")
+    parser.add_argument("--snap-planar-edges", action=argparse.BooleanOptionalAction, default=False,
+                        help="Làm phẳng mặt phẳng thật và kéo sắc cạnh giao (n1 x n2), tự bỏ qua vật cong")
+    parser.add_argument("--snap-radius-mm", type=float, default=3.0,
+                        help="Bán kính kéo sắc cạnh tối đa (mm) để bảo vệ bo góc fillet thật (mặc định 3.0)")
     args = parser.parse_args()
 
     t0 = time.time()
@@ -785,6 +999,14 @@ def main():
             sigma_angle_deg=args.edge_angle_deg,
             preserve_boundary=True,
         )
+
+    # Bước 1.5: Vector Planar Edge Snapping (chỉ chạy trên mặt phẳng thật, tự bỏ qua Cốc)
+    if args.snap_planar_edges:
+        mesh, snap_rep = snap_planar_intersections(
+            mesh,
+            snap_radius_mm=args.snap_radius_mm,
+        )
+        print(f"1.5. Vector Planar Edge Snapping: {snap_rep}")
 
     # Bước 2: Phân loại biên hở
     loops_info = classify_boundary_loops(

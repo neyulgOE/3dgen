@@ -171,7 +171,8 @@ def carve_tsdf_by_silhouette(
     tsdf_4d = tsdf_np[..., 0]
     weight_4d = weight_np[..., 0]
 
-    b_ids, i1, i2, i3 = np.nonzero(weight_4d > 0.0)
+    # Chỉ xét các voxel đang nằm BÊN TRONG hoặc SÁT BỀ MẶT (tsdf < 0.25)
+    b_ids, i1, i2, i3 = np.nonzero((weight_4d > 0.0) & (tsdf_4d < 0.25))
     active_count = int(len(b_ids))
     clipped_count = 0
 
@@ -184,8 +185,9 @@ def carve_tsdf_by_silhouette(
         clipped_count = int(np.count_nonzero(drop))
         if clipped_count > 0:
             db, d1, d2, d3 = b_ids[drop], i1[drop], i2[drop], i3[drop]
-            weight_4d[db, d1, d2, d3] = 0.0
+            # Đổi sang không gian trống (+1.0) nhưng GIỮ NGUYÊN weight > 0 để không thủng Marching Cubes
             tsdf_4d[db, d1, d2, d3] = 1.0
+            weight_4d[db, d1, d2, d3] = np.maximum(weight_4d[db, d1, d2, d3], 1.0)
 
             vbg_dev = tsdf_attr.device
             tsdf_attr[buf_indices_i64] = o3d.core.Tensor(tsdf_np, dtype=tsdf_attr.dtype, device=vbg_dev)

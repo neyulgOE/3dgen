@@ -352,8 +352,25 @@ void MeshViewerWidget::mouseReleaseEvent(QMouseEvent *e)
 
 void MeshViewerWidget::wheelEvent(QWheelEvent *e)
 {
-    float factor = (e->angleDelta().y() > 0) ? 0.85f : 1.18f;
+    int angle = e->angleDelta().y();
+    if (angle == 0) angle = e->angleDelta().x();
+
+    float steps = 0.0f;
+    if (angle != 0) {
+        steps = static_cast<float>(angle) / 120.0f;
+    } else if (!e->pixelDelta().isNull()) {
+        int pix = (e->pixelDelta().y() != 0) ? e->pixelDelta().y() : e->pixelDelta().x();
+        steps = static_cast<float>(pix) / 40.0f;
+    }
+
+    if (steps == 0.0f) {
+        e->ignore();
+        return;
+    }
+
+    float factor = std::pow(0.85f, steps);
     _distance = qBound(0.001f, _distance * factor, 1000.f);
+    e->accept();
     update();
 }
 

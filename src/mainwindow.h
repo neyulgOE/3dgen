@@ -120,6 +120,8 @@ private:
     QCheckBox        *_ppFillHolesCheck = nullptr;
     QCheckBox        *_ppCapBaseCheck = nullptr;
     QCheckBox        *_ppSolidifyCheck = nullptr;
+    QCheckBox        *_chkCadSnapEdges = nullptr;
+    QCheckBox        *_chkCadAlignMm   = nullptr;
     QPushButton      *_meshRemoveBtn  = nullptr;
     QLabel           *_meshInfoLbl    = nullptr;
     QListWidget      *_meshFileList   = nullptr;

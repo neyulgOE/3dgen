@@ -462,6 +462,14 @@ def main():
     parser.add_argument("--depth-prefilter-smoothing", type=str, default="normal")
     parser.add_argument("--depth-prefilter-gapfill", type=str, default="normal")
     parser.add_argument("--depth-prefilter-normal", type=str, default="normal")
+    parser.add_argument("--voxel-clipping", action=argparse.BooleanOptionalAction, default=None,
+                        help="Bật Bước 5.5 GPU Silhouette Carving (mặc định: tự bật cho --manual-turntable, tắt cho Handheld)")
+    parser.add_argument("--voxel-bg-margin-px", type=int, default=3,
+                        help="Khoảng đệm nới mask SAM2 (px) trước khi coi là vùng nền chắc chắn (mặc định 3)")
+    parser.add_argument("--voxel-min-out-views", type=int, default=3,
+                        help="Số góc nhìn tối thiểu rơi ra ngoài nền để cắt bỏ voxel (mặc định 3)")
+    parser.add_argument("--voxel-keyframes", type=int, default=24,
+                        help="Số keyframe phủ đều 360° dùng cho Silhouette Carving (mặc định 24)")
 
     args = parser.parse_args()
 
@@ -616,15 +624,38 @@ def main():
         pivot = (np.asarray(args.turntable_pivot, dtype=np.float64)
                  if args.turntable_pivot is not None else estimated_pivot)
 
-        # 3. Ước lượng trục quay từ mặt bàn bằng RANSAC (nếu không truyền --turntable-axis)
+        # 3. Chuỗi ước lượng trục quay 3 tầng:
+        #    Tầng 1: RANSAC mặt bàn (inlier_ratio >= 0.45)
+        #    Tầng 2: Đường sinh dọc vật thể (Vertical Line Fitting + Angular RANSAC)
+        #    Tầng 3: Fallback mặc định [0, 1, 0]
         if args.turntable_axis is not None:
             world_axis = np.asarray(args.turntable_axis, dtype=np.float64)
             world_axis /= np.linalg.norm(world_axis)
+            axis_info = {"source": "manual_cli", "axis": [round(float(v), 4) for v in world_axis], "fallback": False}
             print(f"   [Turntable] Dùng trục thủ công: {np.round(world_axis, 4).tolist()}")
         else:
             world_axis, axis_info = estimate_turntable_axis_from_table(
                 valid_candidates, depth_np, masks, intrinsic, pivot=pivot)
-            print(f"   [Turntable] Trục mặt bàn RANSAC: {np.round(world_axis, 4).tolist()} ({axis_info})")
+            if not axis_info.get("fallback", False):
+                axis_info["source"] = "table_plane"
+                print(f"   [Turntable][Tier 1] Trục mặt bàn RANSAC: {np.round(world_axis, 4).tolist()} ({axis_info})")
+            else:
+                print(f"   [Turntable][Tier 1] Bỏ qua mặt bàn ({axis_info}) -> thử Tầng 2 (Vertical Lines)...")
+                world_axis, line_axis_info = estimate_turntable_axis_from_object_lines(
+                    valid_candidates, depth_np, masks, intrinsic)
+                axis_info = {**line_axis_info, "tier1_table": axis_info}
+                if not line_axis_info.get("fallback", False):
+                    print(f"   [Turntable][Tier 2] Trục đường sinh dọc: {np.round(world_axis, 4).tolist()} ({line_axis_info})")
+                else:
+                    print(f"   [Turntable][Tier 3] Fallback trục [0, 1, 0] ({line_axis_info})")
+
+        # 3.5. Tinh chỉnh tâm quay bằng giao điểm tia pháp tuyến (chỉ khi không truyền --turntable-pivot)
+        pivot_refine_info = {"refined": False, "reason": "manual_or_none"}
+        if args.turntable_pivot is None and pivot is not None:
+            pivot, pivot_refine_info = refine_turntable_pivot_by_normal_rays(
+                valid_candidates, depth_np, masks, intrinsic,
+                world_axis=world_axis, init_pivot=pivot)
+            print(f"   [Turntable] Tinh chỉnh tâm giao tia pháp tuyến: {np.round(pivot, 4).tolist()} ({pivot_refine_info})")
 
         if len(valid_candidates) > args.turntable_max_tracking_frames:
             positions = np.linspace(0, len(valid_candidates) - 1,
@@ -1206,6 +1237,28 @@ def main():
                   f"(frame median={int(frame_median)}mm range=[{int(frame_lo)},{int(frame_hi)}]mm)")
 
     print(f"   Done: integrated={integrated} skipped={skipped}")
+
+    # Bước 5.5: GPU Pure Silhouette Carving (mặc định chỉ chạy cho --manual-turntable)
+    enable_silhouette_carve = (
+        bool(args.voxel_clipping)
+        if args.voxel_clipping is not None
+        else bool(args.manual_turntable)
+    )
+    if enable_silhouette_carve:
+        from voxel_refiner import carve_tsdf_by_silhouette
+        print(f"5.5. GPU Silhouette Carving (K={args.voxel_keyframes}, "
+              f"bg_margin={args.voxel_bg_margin_px}px, min_out_views={args.voxel_min_out_views})...")
+        vr_info = carve_tsdf_by_silhouette(
+            vbg=volume,
+            fuse_indices=fuse_indices,
+            masks=masks,
+            optimized_poses=optimized_poses,
+            intrinsic=intrinsic,
+            bg_margin_px=args.voxel_bg_margin_px,
+            min_out_views=args.voxel_min_out_views,
+            max_keyframes=args.voxel_keyframes,
+        )
+        print(f"   [SilhouetteCarving] Done: {vr_info}")
 
     # ── 6. Extract Mesh from TSDF (Marching Cubes) ────────────────────────
     print("\n6. Extracting mesh from TSDF (Marching Cubes)...")

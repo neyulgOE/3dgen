@@ -352,7 +352,7 @@ def estimate_turntable_axis_from_table(indices, depth_np, masks, intrinsic, pivo
     inlier_ratio = float(len(inliers)) / max(1, len(pcd_bg.points))
     n = np.array(plane_model[:3], dtype=np.float64)
     n_norm = float(np.linalg.norm(n))
-    if n_norm < 1e-8 or len(inliers) < 500 or inlier_ratio < 0.15:
+    if n_norm < 1e-8 or len(inliers) < 500 or inlier_ratio < 0.45:
         return default_axis, {
             "reason": "weak_table_plane",
             "inliers": len(inliers),
@@ -381,6 +381,385 @@ def estimate_turntable_axis_from_table(indices, depth_np, masks, intrinsic, pivo
         "inliers": int(len(inliers)),
         "inlier_ratio": round(inlier_ratio, 3),
         "fallback": False,
+    }
+
+
+def estimate_turntable_axis_from_object_lines(
+    valid_candidates,
+    depth_np,
+    masks,
+    intrinsic,
+    depth_scale: float = 1000.0,
+    max_frames: int = 12,
+    erode_px: int = 8,
+    col_step: int = 6,
+    min_segment_height_m: float = 0.040,
+    max_line_rmse_m: float = 0.0025,
+    angle_thresh_deg: float = 5.0,
+    min_lines: int = 40,
+    min_inlier_ratio: float = 0.60,
+    max_tilt_deg: float = 35.0,
+):
+    """Tầng 2 ước lượng trục quay bàn xoay từ các đường sinh dọc trên chính vật thể.
+    - Tránh flying pixels bằng cách co mask SAM2 vào `erode_px`.
+    - Tách đoạn liên tục theo chiều sâu để không bắc cầu qua khe rỗng (như lỗ quai cốc).
+    - Chạy Angular RANSAC trên tập hợp vector từ nhiều góc nhìn 360° để triệt tiêu góc vát/nghiêng.
+    - Trả về trục định hướng cùng chiều [0, +1, 0] (hệ OpenCV camera).
+    """
+    default_axis = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    if not valid_candidates:
+        return default_axis, {"source": "default_y", "reason": "no_candidates", "fallback": True}
+
+    K = np.asarray(intrinsic.intrinsic_matrix, dtype=np.float64)
+    fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
+
+    if len(valid_candidates) > max_frames:
+        sample_pos = np.linspace(0, len(valid_candidates) - 1, max_frames).round().astype(int)
+        sample_frames = [valid_candidates[p] for p in np.unique(sample_pos)]
+    else:
+        sample_frames = list(valid_candidates)
+
+    ksize = max(3, 2 * int(erode_px) + 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+    cos_40 = float(np.cos(np.radians(40.0)))
+
+    all_dirs = []
+    per_frame_dirs = {}
+
+    for f_idx in sample_frames:
+        mask = masks[f_idx]
+        depth = depth_np[f_idx]
+        if mask is None or depth is None:
+            continue
+
+        mask_u8 = (mask > 0).astype(np.uint8)
+        eroded = cv2.erode(mask_u8, kernel, iterations=1)
+        if int(np.count_nonzero(eroded)) < 300:
+            small_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+            eroded = cv2.erode(mask_u8, small_k, iterations=1)
+        if int(np.count_nonzero(eroded)) < 200:
+            continue
+
+        ys_all, xs_all = np.nonzero(eroded)
+        x0, x1 = int(xs_all.min()), int(xs_all.max())
+        frame_dirs = []
+
+        for u in range(x0, x1 + 1, max(1, int(col_step))):
+            col_mask = eroded[:, u] > 0
+            vs = np.nonzero(col_mask)[0]
+            if vs.size < 18:
+                continue
+
+            z_mm = depth[vs, u].astype(np.float64)
+            valid = (z_mm >= 120.0) & (z_mm <= 1500.0)
+            vs = vs[valid]
+            z_mm = z_mm[valid]
+            if vs.size < 18:
+                continue
+
+            # Tách các đoạn liên tục theo pixel (v_gap <= 3) và độ sâu (dz <= 15mm)
+            # để không khớp đường thẳng xuyên qua lỗ quai cốc hoặc khe hở
+            breaks = np.nonzero((np.diff(vs) > 3) | (np.abs(np.diff(z_mm)) > 15.0))[0] + 1
+            segments = np.split(np.arange(vs.size), breaks)
+            best_seg = max(segments, key=len)
+            if best_seg.size < 18:
+                continue
+
+            v_seg = vs[best_seg].astype(np.float64)
+            z_seg = z_mm[best_seg] / float(depth_scale)
+            x_seg = (float(u) - cx) * z_seg / fx
+            y_seg = (v_seg - cy) * z_seg / fy
+            pts = np.stack([x_seg, y_seg, z_seg], axis=1)
+
+            seg_height = float(np.linalg.norm(pts[-1] - pts[0]))
+            if seg_height < min_segment_height_m:
+                continue
+
+            mean_p = pts.mean(axis=0)
+            centered = pts - mean_p
+            _, _, vt = np.linalg.svd(centered, full_matrices=False)
+            d = vt[0]
+            if d[1] < 0.0:
+                d = -d
+            if d[1] < cos_40:
+                continue
+
+            # Kiểm tra độ thẳng của đường sinh (loại đoạn cong/quai/nhiễu)
+            proj = centered @ d
+            perp = centered - np.outer(proj, d)
+            rmse = float(np.sqrt(np.mean(np.sum(perp * perp, axis=1))))
+            if rmse > max_line_rmse_m:
+                continue
+
+            frame_dirs.append(d)
+            all_dirs.append(d)
+
+        if len(frame_dirs) >= 4:
+            fm = np.mean(frame_dirs, axis=0)
+            fn = float(np.linalg.norm(fm))
+            if fn > 1e-8:
+                per_frame_dirs[f_idx] = fm / fn
+
+    if len(all_dirs) < min_lines:
+        return default_axis, {
+            "source": "default_y",
+            "reason": "insufficient_vertical_lines",
+            "num_lines": int(len(all_dirs)),
+            "fallback": True,
+        }
+
+    dirs = np.asarray(all_dirs, dtype=np.float64)
+    # Angular RANSAC (tất định, vector hóa trên toàn bộ ứng viên)
+    if len(dirs) > 250:
+        hyp_idx = np.linspace(0, len(dirs) - 1, 250).round().astype(int)
+        hyps = dirs[hyp_idx]
+    else:
+        hyps = dirs
+
+    cos_thresh = float(np.cos(np.radians(angle_thresh_deg)))
+    sim = np.abs(hyps @ dirs.T)
+    counts = np.sum(sim >= cos_thresh, axis=1)
+    best_h = int(np.argmax(counts))
+    inlier_mask = sim[best_h] >= cos_thresh
+    inlier_ratio = float(np.mean(inlier_mask))
+
+    axis_est = dirs[inlier_mask].mean(axis=0)
+    axis_norm = float(np.linalg.norm(axis_est))
+    if axis_norm < 1e-8:
+        return default_axis, {"source": "default_y", "reason": "degenerate_line_axis", "fallback": True}
+    axis_est = axis_est / axis_norm
+    if axis_est[1] < 0.0:
+        axis_est = -axis_est
+
+    tilt_deg = float(np.degrees(np.arccos(np.clip(np.dot(axis_est, default_axis), -1.0, 1.0))))
+
+    # Đo độ phân tán giữa trục từng frame với trục chung (cảnh báo nếu vật bị đặt nghiêng/vát nón)
+    per_frame_spread_deg = 0.0
+    if len(per_frame_dirs) >= 3:
+        f_angles = [
+            float(np.degrees(np.arccos(np.clip(abs(np.dot(v, axis_est)), 0.0, 1.0))))
+            for v in per_frame_dirs.values()
+        ]
+        per_frame_spread_deg = float(np.median(f_angles))
+
+    if inlier_ratio < min_inlier_ratio or tilt_deg > max_tilt_deg:
+        return default_axis, {
+            "source": "default_y",
+            "reason": "low_line_consensus" if inlier_ratio < min_inlier_ratio else "excessive_tilt",
+            "num_lines": int(len(dirs)),
+            "inlier_ratio": round(inlier_ratio, 3),
+            "camera_tilt_deg": round(tilt_deg, 2),
+            "per_frame_spread_deg": round(per_frame_spread_deg, 2),
+            "fallback": True,
+        }
+
+    return axis_est, {
+        "source": "object_vertical_lines",
+        "reason": "vertical_lines_ransac",
+        "axis": [round(float(v), 4) for v in axis_est],
+        "camera_tilt_deg": round(tilt_deg, 2),
+        "num_lines": int(len(dirs)),
+        "inliers": int(np.sum(inlier_mask)),
+        "inlier_ratio": round(inlier_ratio, 3),
+        "per_frame_spread_deg": round(per_frame_spread_deg, 2),
+        "fallback": False,
+    }
+
+
+def refine_turntable_pivot_by_normal_rays(
+    valid_candidates,
+    depth_np,
+    masks,
+    intrinsic,
+    world_axis: np.ndarray,
+    init_pivot: np.ndarray,
+    depth_scale: float = 1000.0,
+    max_frames: int = 8,
+    erode_px: int = 6,
+    min_eig_ratio: float = 0.20,
+    max_iqr_m: float = 0.004,
+    max_shift_m: float = 0.025,
+):
+    """Tinh chỉnh tọa độ ngang (vuông góc `world_axis`) của tâm xoay bằng giao điểm
+    các tia pháp tuyến bề mặt hướng vào trong trên 3 lát cắt (30%, 50%, 70% chiều cao),
+    dùng Huber IRLS để tự động loại các tia rơi vào quai cốc hoặc nhiễu.
+    """
+    init_pivot = np.asarray(init_pivot, dtype=np.float64)
+    a = np.asarray(world_axis, dtype=np.float64)
+    a = a / max(float(np.linalg.norm(a)), 1e-8)
+
+    if not valid_candidates:
+        return init_pivot, {"refined": False, "reason": "no_candidates"}
+
+    # Hệ cơ sở trực chuẩn (e1, e2, a)
+    ref = np.array([1.0, 0.0, 0.0], dtype=np.float64) if abs(a[0]) < 0.9 else np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    e1 = np.cross(a, ref)
+    e1 /= float(np.linalg.norm(e1))
+    e2 = np.cross(a, e1)
+
+    K = np.asarray(intrinsic.intrinsic_matrix, dtype=np.float64)
+    fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
+
+    if len(valid_candidates) > max_frames:
+        sample_pos = np.linspace(0, len(valid_candidates) - 1, max_frames).round().astype(int)
+        sample_frames = [valid_candidates[p] for p in np.unique(sample_pos)]
+    else:
+        sample_frames = list(valid_candidates)
+
+    ksize = max(3, 2 * int(erode_px) + 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+
+    p2_list = []
+    n2_list = []
+
+    for f_idx in sample_frames:
+        mask = masks[f_idx]
+        depth = depth_np[f_idx]
+        if mask is None or depth is None:
+            continue
+
+        eroded = cv2.erode((mask > 0).astype(np.uint8), kernel, iterations=1)
+        vs, us = np.nonzero((eroded > 0) & (depth >= 120) & (depth <= 1500))
+        if vs.size < 200:
+            continue
+
+        z = depth[vs, us].astype(np.float64) / float(depth_scale)
+        x = (us.astype(np.float64) - cx) * z / fx
+        y = (vs.astype(np.float64) - cy) * z / fy
+        pts = np.stack([x, y, z], axis=1)
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts)
+        pcd = pcd.voxel_down_sample(0.003)
+        if len(pcd.points) < 100:
+            continue
+        pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.012, max_nn=25))
+        pcd.orient_normals_towards_camera_location(np.array([0.0, 0.0, 0.0]))
+
+        p_arr = np.asarray(pcd.points, dtype=np.float64)
+        # Pháp tuyến hướng vào bên trong vật thể
+        n_in = -np.asarray(pcd.normals, dtype=np.float64)
+
+        h = p_arr @ a
+        h_lo, h_hi = float(np.percentile(h, 5)), float(np.percentile(h, 95))
+        h_span = h_hi - h_lo
+        if h_span < 0.030:
+            continue
+
+        band_half = max(0.004, 0.06 * h_span)
+        band_mask = np.zeros(len(p_arr), dtype=bool)
+        for frac in (0.30, 0.50, 0.70):
+            h0 = h_lo + frac * h_span
+            band_mask |= (np.abs(h - h0) <= band_half)
+
+        # Chỉ giữ điểm thành đứng (pháp tuyến gần vuông góc trục quay)
+        side_mask = band_mask & (np.abs(n_in @ a) < 0.35)
+        if int(np.count_nonzero(side_mask)) < 30:
+            continue
+
+        p_sel = p_arr[side_mask]
+        n_sel = n_in[side_mask]
+
+        p2 = np.stack([p_sel @ e1, p_sel @ e2], axis=1)
+        n2_raw = np.stack([n_sel @ e1, n_sel @ e2], axis=1)
+        n2_len = np.linalg.norm(n2_raw, axis=1)
+        ok_n = n2_len > 0.5
+        if int(np.count_nonzero(ok_n)) < 20:
+            continue
+
+        p2_list.append(p2[ok_n])
+        n2_list.append(n2_raw[ok_n] / n2_len[ok_n, None])
+
+    if not p2_list:
+        return init_pivot, {"refined": False, "reason": "no_valid_slices"}
+
+    p2_all = np.vstack(p2_list)
+    n2_all = np.vstack(n2_list)
+    if len(p2_all) < 120:
+        return init_pivot, {"refined": False, "reason": "too_few_rays", "num_rays": int(len(p2_all))}
+
+    # Cổng 1: Kiểm tra độ mở góc pháp tuyến (loại trừ vật phẳng chỉ lộ 1 mặt)
+    scatter = (n2_all.T @ n2_all) / float(len(n2_all))
+    eigvals = np.linalg.eigvalsh(scatter)
+    eig_ratio = float(eigvals[0] / max(eigvals[1], 1e-9))
+    if eig_ratio < min_eig_ratio:
+        return init_pivot, {
+            "refined": False,
+            "reason": "low_normal_angular_spread",
+            "eig_ratio": round(eig_ratio, 3),
+            "num_rays": int(len(p2_all)),
+        }
+
+    # Giải giao điểm tia pháp tuyến bằng Huber IRLS (3 vòng) để loại trừ tia rơi vào quai cốc
+    w = np.ones(len(p2_all), dtype=np.float64)
+    c_2d = np.array([float(np.dot(init_pivot, e1)), float(np.dot(init_pivot, e2))], dtype=np.float64)
+    huber_delta = 0.004  # 4mm
+
+    # Ma trận chiếu vuông góc Q_i = I - n_i n_i^T (tính sẵn cho mọi tia)
+    q00 = 1.0 - n2_all[:, 0] * n2_all[:, 0]
+    q01 = -n2_all[:, 0] * n2_all[:, 1]
+    q11 = 1.0 - n2_all[:, 1] * n2_all[:, 1]
+
+    for _ in range(3):
+        A = np.array([
+            [float(np.sum(w * q00)), float(np.sum(w * q01))],
+            [float(np.sum(w * q01)), float(np.sum(w * q11))],
+        ], dtype=np.float64)
+        rhs0 = q00 * p2_all[:, 0] + q01 * p2_all[:, 1]
+        rhs1 = q01 * p2_all[:, 0] + q11 * p2_all[:, 1]
+        b = np.array([float(np.sum(w * rhs0)), float(np.sum(w * rhs1))], dtype=np.float64)
+
+        if abs(float(np.linalg.det(A))) < 1e-10:
+            return init_pivot, {"refined": False, "reason": "singular_ray_system"}
+
+        c_2d = np.linalg.solve(A, b)
+        diff = c_2d[None, :] - p2_all
+        signed_along = np.sum(diff * n2_all, axis=1)
+        perp_vec = diff - signed_along[:, None] * n2_all
+        perp_dist = np.linalg.norm(perp_vec, axis=1)
+
+        w = np.minimum(1.0, huber_delta / np.maximum(perp_dist, 1e-6))
+        w = np.where(signed_along > 0.0, w, w * 0.1)
+
+    inlier_mask = (w >= 0.5) & (signed_along > 0.0)
+    inlier_frac = float(np.mean(inlier_mask))
+    if inlier_frac < 0.50 or int(np.sum(inlier_mask)) < 60:
+        return init_pivot, {
+            "refined": False,
+            "reason": "low_ray_inlier_fraction",
+            "inlier_frac": round(inlier_frac, 3),
+            "eig_ratio": round(eig_ratio, 3),
+        }
+
+    radii = np.linalg.norm(p2_all[inlier_mask] - c_2d[None, :], axis=1)
+    r_med = float(np.median(radii))
+    iqr_m = float(np.percentile(radii, 75) - np.percentile(radii, 25))
+
+    # Giữ nguyên cao độ dọc theo `world_axis` của pivot gốc
+    h_init = float(np.dot(init_pivot, a))
+    refined_pivot = c_2d[0] * e1 + c_2d[1] * e2 + h_init * a
+    shift_m = float(np.linalg.norm(refined_pivot - init_pivot))
+
+    if iqr_m > max_iqr_m or shift_m > max_shift_m or not (0.015 <= r_med <= 0.20):
+        return init_pivot, {
+            "refined": False,
+            "reason": "radius_or_shift_gate_failed",
+            "eig_ratio": round(eig_ratio, 3),
+            "radius_mm": round(r_med * 1000.0, 2),
+            "iqr_mm": round(iqr_m * 1000.0, 2),
+            "shift_mm": round(shift_m * 1000.0, 2),
+            "inlier_frac": round(inlier_frac, 3),
+        }
+
+    return refined_pivot, {
+        "refined": True,
+        "reason": "normal_ray_intersection",
+        "eig_ratio": round(eig_ratio, 3),
+        "radius_mm": round(r_med * 1000.0, 2),
+        "iqr_mm": round(iqr_m * 1000.0, 2),
+        "shift_mm": round(shift_m * 1000.0, 2),
+        "inlier_frac": round(inlier_frac, 3),
+        "num_rays": int(len(p2_all)),
     }
 
 

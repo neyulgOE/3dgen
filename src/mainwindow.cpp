@@ -997,23 +997,28 @@ void MainWindow::wireSelf() {
   connect(_ctrl->scanEngine(), &ScanEngine::statsUpdated, this,
           &MainWindow::onAccumStatsUpdated);
 
-  // Camera Model Selection
+  // Camera Model Selection (RGB-aligned 640x480 presets when disconnected)
   connect(_cameraModelCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+      if (_camConnected) {
+          appendLog("⚠️ RealSense đang kết nối: giữ nguyên intrinsics thực từ RS2_STREAM_COLOR, bỏ qua preset dropdown.");
+          return;
+      }
+
+      double fx = 615.0, fy = 615.0, cx = 320.0, cy = 240.0;
       if (index == 0) { // d435f
-          _fxSpin->setValue(386.652);
-          _fySpin->setValue(386.652);
-          _cxSpin->setValue(326.089);
-          _cySpin->setValue(240.785);
+          fx = 615.0; fy = 615.0; cx = 320.0; cy = 240.0;
       } else if (index == 1) { // d435
-          _fxSpin->setValue(389.142);
-          _fySpin->setValue(389.142);
-          _cxSpin->setValue(322.228);
-          _cySpin->setValue(241.031);
+          fx = 615.0; fy = 615.0; cx = 320.0; cy = 240.0;
       } else if (index == 2) { // d435if
-          _fxSpin->setValue(389.242);
-          _fySpin->setValue(389.242);
-          _cxSpin->setValue(322.072);
-          _cySpin->setValue(237.180);
+          fx = 608.0; fy = 608.0; cx = 320.0; cy = 240.0;
+      }
+
+      {
+          const QSignalBlocker b1(_fxSpin), b2(_fySpin), b3(_cxSpin), b4(_cySpin);
+          _fxSpin->setValue(fx);
+          _fySpin->setValue(fy);
+          _cxSpin->setValue(cx);
+          _cySpin->setValue(cy);
       }
       pushIntrinsics(); // apply immediately when changed
   });
@@ -1232,6 +1237,13 @@ void MainWindow::setCameraConnectedState(bool connected) {
   _camConnBtn->setEnabled(!connected);
   _camDiscBtn->setEnabled(connected);
   _camSourceCombo->setEnabled(!connected);
+  if (_cameraModelCombo) {
+    _cameraModelCombo->setEnabled(!connected);
+    _cameraModelCombo->setToolTip(
+        connected
+            ? "Đang khóa: dùng intrinsics thực đọc từ RS2_STREAM_COLOR của RealSense."
+            : "Chọn preset intrinsics mặc định (RGB-aligned 640x480) khi chưa kết nối camera.");
+  }
   if (connected) {
     _camStatusLbl->setText("● Connected");
     _camStatusLbl->setStyleSheet("color:#3ddc84;font-weight:bold;");
@@ -1828,16 +1840,13 @@ void MainWindow::onBuildMeshClicked()
                                 // 100 Taubin iterations visibly rounds box edges and
                                 // closes thin, partially observed surfaces.  Keep the
                                 // builder's feature-preserving default instead.
-                                "--smooth-iters", "20",
+                                "--smooth-iters", manualTurntable ? "6" : "20",
                                 "--max-input-frames", "1000",
                                 "--tracking-report", recordDir.absoluteFilePath("tracking_report.json")};
     if (manualTurntable) {
-        // Fixed-camera rotation needs angular coverage, not hundreds of near-
-        // duplicate video frames.  This keeps FastSAM/Open3D within laptop
-        // RAM/VRAM while retaining about one view every 7.5 degrees.
         builderArgs << "--manual-turntable"
-                    << "--turntable-yaw-mode" << "uniform"
-                    << "--turntable-max-tracking-frames" << "48";
+                    << "--turntable-yaw-mode" << "tracked"
+                    << "--turntable-max-tracking-frames" << "120";
     }
     process->setProcessChannelMode(QProcess::MergedChannels);
     connect(process, &QProcess::readyReadStandardOutput, this, [this, process]() {

@@ -60,7 +60,9 @@ def _points_in_polygon_2d(pts: np.ndarray, poly: np.ndarray) -> np.ndarray:
     return inside
 
 
-def _clean_mesh_topology(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMesh:
+def _clean_mesh_topology(mesh: o3d.geometry.TriangleMesh, merge_eps: float = 1e-5) -> o3d.geometry.TriangleMesh:
+    if merge_eps > 0:
+        mesh.merge_close_vertices(merge_eps)
     mesh.remove_degenerate_triangles()
     mesh.remove_duplicated_triangles()
     mesh.remove_duplicated_vertices()
@@ -239,14 +241,20 @@ def bilateral_normal_filter(
 def classify_boundary_loops(
     mesh: o3d.geometry.TriangleMesh,
     up_vec: np.ndarray,
-    max_hole_extent_ratio: float = 0.35,
+    max_hole_extent_ratio: float = 0.18,
+    min_major_loop_ratio: float = 0.30,
+    preserve_through_holes: bool = True,
 ):
     """Phân loại tất cả các vòng biên hở thành:
       - 'base': vòng biên lớn nằm ở đáy tiếp xúc mặt bàn (thấp nhất theo up_vec).
       - 'opening': vòng biên lớn nằm ở đỉnh/miệng (như miệng cốc, không bịt đặc).
-      - 'hole': lỗ thủng cục bộ trên thân/quai cần vá mượt.
+      - 'aperture': khe rỗng xuyên thấu (như lỗ quai cốc), tuyệt đối không vá bít.
+      - 'hole': lỗ thủng cục bộ trên bề mặt cần vá mượt.
+      - 'large_open': biên hở lớn không rõ đáy/miệng.
     """
+    mesh.compute_vertex_normals()
     verts = np.asarray(mesh.vertices, dtype=np.float64)
+    v_normals = np.asarray(mesh.vertex_normals, dtype=np.float64)
     tris = np.asarray(mesh.triangles, dtype=np.int64)
     loops = _extract_directed_boundary_loops(tris)
     if not loops:
@@ -257,22 +265,39 @@ def classify_boundary_loops(
     h_min, h_max = float(heights.min()), float(heights.max())
     h_span = max(h_max - h_min, 1e-6)
 
+    # Bước 1: Trích đặc trưng hình học cho từng vòng biên
     classified = []
     for lid, loop in enumerate(loops):
         pts = verts[loop]
+        n_loop = v_normals[loop]
+        centroid = pts.mean(axis=0)
         extent = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
         extent_ratio = extent / max(diag, 1e-6)
         h_loop = pts @ up_vec
         h_mean_norm = float((h_loop.mean() - h_min) / h_span)
         h_spread_norm = float((h_loop.max() - h_loop.min()) / h_span)
 
-        # Nhận diện đáy phẳng (nằm sát h_min, trải rộng) hoặc miệng hở (nằm sát h_max, trải rộng)
-        if extent_ratio >= max_hole_extent_ratio and h_mean_norm <= 0.18 and h_spread_norm <= 0.25:
+        # Pháp tuyến mặt phẳng PCA của vòng biên
+        centered = pts - centroid
+        _, _, vt = np.linalg.svd(centered, full_matrices=False)
+        plane_normal = vt[2]
+
+        # Độ đồng hướng pháp tuyến đỉnh & độ thẳng hàng với pháp tuyến mặt phẳng lỗ
+        mean_v_normal = n_loop.mean(axis=0)
+        normal_coherence = float(np.linalg.norm(mean_v_normal))
+        mean_v_normal_unit = mean_v_normal / max(normal_coherence, 1e-8)
+        normal_plane_align = float(np.mean(np.abs(n_loop @ plane_normal)))
+
+        if extent_ratio >= min_major_loop_ratio and h_mean_norm <= 0.18 and h_spread_norm <= 0.25:
             kind = "base"
-        elif extent_ratio >= max_hole_extent_ratio and h_mean_norm >= 0.78 and h_spread_norm <= 0.30:
+        elif extent_ratio >= min_major_loop_ratio and h_mean_norm >= 0.78 and h_spread_norm <= 0.30:
             kind = "opening"
         elif extent_ratio <= max_hole_extent_ratio:
-            kind = "hole"
+            # Nếu pháp tuyến đỉnh tỏa xung quanh hoặc vuông góc mặt phẳng lỗ -> mép khe/ống xuyên thấu
+            if preserve_through_holes and (normal_coherence < 0.45 or normal_plane_align < 0.45):
+                kind = "aperture"
+            else:
+                kind = "hole"
         else:
             kind = "large_open"
 
@@ -284,7 +309,55 @@ def classify_boundary_loops(
             "extent_mm": round(extent * 1000.0, 2),
             "extent_ratio": round(extent_ratio, 3),
             "height_norm": round(h_mean_norm, 3),
+            "normal_coherence": round(normal_coherence, 3),
+            "normal_plane_align": round(normal_plane_align, 3),
+            "_centroid": centroid,
+            "_extent": extent,
+            "_plane_normal": plane_normal,
+            "_mean_v_normal": mean_v_normal_unit,
         })
+
+    # Bước 2: Bắt cặp 2 vòng biên song song đối diện nhau (mặt trước & sau của khe quai cốc)
+    if preserve_through_holes:
+        cand_ids = [i for i, item in enumerate(classified) if item["kind"] == "hole"]
+        paired = set()
+        for a_idx in range(len(cand_ids)):
+            i = cand_ids[a_idx]
+            ci = classified[i]
+            for b_idx in range(a_idx + 1, len(cand_ids)):
+                j = cand_ids[b_idx]
+                cj = classified[j]
+
+                # Khoảng cách 2 tâm nhỏ (độ dày quai/thành thường 3..35mm)
+                dist_m = float(np.linalg.norm(ci["_centroid"] - cj["_centroid"]))
+                max_ext = max(ci["_extent"], cj["_extent"], 1e-6)
+                min_ext = min(ci["_extent"], cj["_extent"])
+                if dist_m > min(0.035, max_ext * 1.35):
+                    continue
+                # Kích thước 2 lỗ tương đương nhau
+                if (min_ext / max_ext) < 0.45:
+                    continue
+                # 2 mặt phẳng lỗ gần song song & nằm đối diện dọc theo trục pháp tuyến mặt phẳng
+                plane_parallel = abs(float(np.dot(ci["_plane_normal"], cj["_plane_normal"])))
+                if plane_parallel < 0.75:
+                    continue
+                delta = cj["_centroid"] - ci["_centroid"]
+                delta_unit = delta / max(dist_m, 1e-8)
+                axial_align = abs(float(np.dot(delta_unit, ci["_plane_normal"])))
+                # Pháp tuyến vỏ của 2 mặt hướng ngược chiều nhau
+                opp_normals = float(np.dot(ci["_mean_v_normal"], cj["_mean_v_normal"]))
+                if axial_align >= 0.55 and opp_normals < -0.25:
+                    paired.add(i)
+                    paired.add(j)
+
+        for idx in paired:
+            classified[idx]["kind"] = "aperture"
+
+    # Dọn các khóa nội bộ trước khi trả về
+    for item in classified:
+        for k in ("_centroid", "_extent", "_plane_normal", "_mean_v_normal"):
+            item.pop(k, None)
+
     return classified
 
 
@@ -531,7 +604,11 @@ def cap_base_delaunay(
     if has_colors:
         mesh.vertex_colors = o3d.utility.Vector3dVector(all_colors)
     mesh = _clean_mesh_topology(mesh)
-    return mesh, {"capped": True, "triangles_added": int(len(global_base_tris))}
+    return mesh, {
+        "capped": True,
+        "triangles_added": int(len(global_base_tris)),
+        "base_up_normal": (-n_base).tolist(),
+    }
 
 
 # ── 6. Tạo độ dày thành (Solidify / Shell-to-Solid cho cốc/bát hở miệng) ────
@@ -588,7 +665,74 @@ def solidify_open_shell(mesh: o3d.geometry.TriangleMesh, thickness_mm: float = 3
     }
 
 
-# ── 7. CLI Entry Point ──────────────────────────────────────────────────────
+# ── 7. Chuẩn hóa hệ tọa độ CAD ──────────────────────────────────────────────
+
+def align_mesh_to_cad_frame(
+    mesh: o3d.geometry.TriangleMesh,
+    up_axis_vec: np.ndarray,
+    scale_to_mm: bool = False,
+):
+    """Chuẩn hóa lưới từ hệ tọa độ camera OpenCV sang hệ CAD chuẩn:
+      - Trục đứng xoay trùng +Z ([0, 0, 1]) theo pháp tuyến đáy (hoặc up_vec).
+      - Mặt đáy đặt phẳng tại Z = 0.
+      - Tâm ngang (X, Y) đưa về gốc (0, 0).
+      - (Tùy chọn) Nhân 1000.0 để đổi đơn vị từ mét sang milimét.
+    """
+    src = np.asarray(up_axis_vec, dtype=np.float64)
+    src_norm = float(np.linalg.norm(src))
+    if src_norm < 1e-8:
+        src = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    else:
+        src = src / src_norm
+
+    dst = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    dot = float(np.clip(np.dot(src, dst), -1.0, 1.0))
+
+    if dot > 1.0 - 1e-9:
+        R = np.eye(3, dtype=np.float64)
+    elif dot < -1.0 + 1e-9:
+        R = np.diag([1.0, -1.0, -1.0])
+    else:
+        axis = np.cross(src, dst)
+        axis = axis / float(np.linalg.norm(axis))
+        angle = float(np.arccos(dot))
+        K = np.array([
+            [0.0, -axis[2], axis[1]],
+            [axis[2], 0.0, -axis[0]],
+            [-axis[1], axis[0], 0.0],
+        ], dtype=np.float64)
+        R = np.eye(3, dtype=np.float64) + np.sin(angle) * K + (1.0 - np.cos(angle)) * (K @ K)
+
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    verts_rot = verts @ R.T
+
+    # Đưa tâm bounding-box ngang (X, Y) về (0, 0) và đáy (Z_min) về 0
+    x_center = 0.5 * (float(verts_rot[:, 0].min()) + float(verts_rot[:, 0].max()))
+    y_center = 0.5 * (float(verts_rot[:, 1].min()) + float(verts_rot[:, 1].max()))
+    z_min = float(verts_rot[:, 2].min())
+    verts_rot[:, 0] -= x_center
+    verts_rot[:, 1] -= y_center
+    verts_rot[:, 2] -= z_min
+
+    scale = 1000.0 if scale_to_mm else 1.0
+    if scale != 1.0:
+        verts_rot *= scale
+
+    mesh.vertices = o3d.utility.Vector3dVector(verts_rot)
+    mesh.compute_vertex_normals()
+    mesh.compute_triangle_normals()
+
+    ext = verts_rot.max(axis=0) - verts_rot.min(axis=0)
+    unit = "mm" if scale_to_mm else "m"
+    return mesh, {
+        "aligned": True,
+        "tilt_corrected_deg": round(float(np.degrees(np.arccos(dot))), 2),
+        "unit": unit,
+        "bbox": [round(float(v), 2) for v in ext],
+    }
+
+
+# ── 8. CLI Entry Point ──────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Hậu xử lý Mesh-to-CAD (Làm mịn giữ cạnh, vá lỗ cong, bịt đáy, Solidify)")
@@ -601,14 +745,20 @@ def main():
     parser.add_argument("--edge-angle-deg", type=float, default=28.0, help="Ngưỡng góc giữ cạnh sắc (độ)")
     parser.add_argument("--fill-holes", action=argparse.BooleanOptionalAction, default=True,
                         help="Tự động vá lỗ thủng cục bộ kèm làm mượt độ cong")
-    parser.add_argument("--max-hole-ratio", type=float, default=0.35,
-                        help="Tỷ lệ độ trải tối đa so với đường chéo vật để coi là lỗ thủng")
+    parser.add_argument("--max-hole-ratio", type=float, default=0.18,
+                        help="Tỷ lệ độ trải tối đa so với đường chéo vật để coi là lỗ thủng cục bộ")
+    parser.add_argument("--preserve-through-holes", action=argparse.BooleanOptionalAction, default=True,
+                        help="Bảo vệ khe rỗng xuyên thấu (như lỗ quai cốc) khỏi bị vá nhầm thành lỗ thủng")
     parser.add_argument("--cap-base", action=argparse.BooleanOptionalAction, default=True,
                         help="Tự động bịt đáy phẳng bằng Delaunay 2D")
     parser.add_argument("--solidify-mm", type=float, default=0.0,
                         help="Tạo độ dày thành vỏ kín khối (mm) cho cốc/bát hở miệng (0 = tắt)")
     parser.add_argument("--target-triangles", type=int, default=0,
                         help="Giảm số tam giác về mức mục tiêu bằng Quadric Decimation (0 = giữ nguyên)")
+    parser.add_argument("--align-cad", action=argparse.BooleanOptionalAction, default=False,
+                        help="Xoay trục đứng về +Z, đặt đáy tại Z=0, đưa tâm (X, Y) về (0, 0)")
+    parser.add_argument("--export-mm", action=argparse.BooleanOptionalAction, default=False,
+                        help="Nhân tọa độ x1000 sang đơn vị mm khi xuất file CAD (.stl/.obj)")
     args = parser.parse_args()
 
     t0 = time.time()
@@ -637,11 +787,17 @@ def main():
         )
 
     # Bước 2: Phân loại biên hở
-    loops_info = classify_boundary_loops(mesh, up_vec, max_hole_extent_ratio=args.max_hole_ratio)
+    loops_info = classify_boundary_loops(
+        mesh, up_vec,
+        max_hole_extent_ratio=args.max_hole_ratio,
+        preserve_through_holes=args.preserve_through_holes,
+    )
     print(f"2. Phân loại biên hở ({len(loops_info)} vòng):")
     for info in loops_info:
         print(f"   - Loop #{info['id']}: kind={info['kind']:10s} | verts={info['vertices']:4d} "
-              f"| extent={info['extent_mm']:5.1f}mm ({info['extent_ratio']:.2f}) | h_norm={info['height_norm']:.2f}")
+              f"| extent={info['extent_mm']:5.1f}mm ({info['extent_ratio']:.2f}) "
+              f"| h_norm={info['height_norm']:.2f} | coh={info['normal_coherence']:.2f} "
+              f"| align={info['normal_plane_align']:.2f}")
 
     # Bước 3: Vá lỗ cục bộ + Fairing cong
     if args.fill_holes:
@@ -649,9 +805,16 @@ def main():
         print(f"3. Vá lỗ cục bộ (Curvature Fairing): {hole_rep}")
 
     # Bước 4: Bịt đáy phẳng bằng Delaunay 2D
+    cad_up_vec = up_vec.copy()
     if args.cap_base:
-        loops_after = classify_boundary_loops(mesh, up_vec, max_hole_extent_ratio=args.max_hole_ratio)
+        loops_after = classify_boundary_loops(
+            mesh, up_vec,
+            max_hole_extent_ratio=args.max_hole_ratio,
+            preserve_through_holes=args.preserve_through_holes,
+        )
         mesh, base_rep = cap_base_delaunay(mesh, loops_after, up_vec)
+        if base_rep.get("capped") and "base_up_normal" in base_rep:
+            cad_up_vec = np.asarray(base_rep["base_up_normal"], dtype=np.float64)
         print(f"4. Bịt đáy phẳng (Delaunay 2D): {base_rep}")
 
     # Bước 5: Tạo độ dày thành cho vật hở miệng (tùy chọn)
@@ -665,6 +828,15 @@ def main():
         mesh = mesh.simplify_quadric_decimation(target_number_of_triangles=args.target_triangles)
         mesh = _clean_mesh_topology(mesh)
         print(f"6. Quadric Decimation: {before:,} -> {len(mesh.triangles):,} tam giác")
+
+    # Bước 7: Chuẩn hóa hệ tọa độ CAD (+Z up, đáy Z=0, tâm XY=0, tùy chọn mm)
+    if args.align_cad or args.export_mm:
+        mesh, cad_rep = align_mesh_to_cad_frame(
+            mesh,
+            up_axis_vec=cad_up_vec,
+            scale_to_mm=args.export_mm,
+        )
+        print(f"7. Chuẩn hóa hệ CAD: {cad_rep}")
 
     out_path = args.output
     if not out_path:
